@@ -1,35 +1,38 @@
-# agents/all_agents.py
+# agents/react_agent.py
 #
-# All agent node functions for the Air Pollution Monitoring LangGraph pipeline.
+# ReAct (Reason + Act) agent that replaces the entire linear nine-agent pipeline.
 #
-# AGENT GRAPH TOPOLOGY:
+# PATTERN:
+#   The LLM is given ALL tools at once (sensor + action).
+#   It iterates through a Thought → Tool call → Observation loop
+#   until it decides it has enough information to write the final report.
 #
-#   supervisor_init
-#       |
-#       +-- ground_sensor_agent      (reads all ground station data, computes network AQI status)
-#       |
-#       +-- satellite_agent          (processes satellite imagery, identifies hotspots and plumes)
-#       |
-#       +-- meteorological_agent     (analyzes dispersion conditions, wind trajectories)
-#       |
-#       +-- source_identification_agent  (cross-references sensors + satellite + inventory)
-#       |
-#       +-- health_impact_agent      (population exposure, clinical risk, hospital preparedness)
-#       |
-#       +-- mitigation_agent         (generates prioritized action plan, calls action tools)
-#       |
-#       +-- alert_agent              (issues public alerts and regulatory notifications)
-#       |
-#   supervisor_synthesis             (compiles situation report, final risk score)
+# LINEAR vs ReAct CONTRAST:
 #
-# Each agent reads the state dict, calls tools or LLM, and returns an updated state dict.
-# All agents are pure functions: (state: dict) -> dict
+#   Linear (old):
+#     supervisor_init → ground_sensor → satellite → met → source
+#       → health → mitigation → alert → supervisor_synthesis
+#     Each node runs EXACTLY ONCE in a hard-coded order.
+#     emergency_triggered modifies text but never changes the graph path.
+#
+#   ReAct (new):
+#     A single node runs in a loop. The LLM decides:
+#       - which tool to call next
+#       - whether to re-call a tool (e.g. re-check sensors after mitigation)
+#       - whether to skip a tool (clean day → no emergency tools needed)
+#       - when it has enough information to stop and write the report
+#
+# This file contains:
+#   - REACT_SYSTEM_PROMPT   : the master instructions given to the LLM
+#   - run_react_agent()     : the main loop
+#   - _demo_react_run()     : deterministic fallback when no API key is set
 
+import os
 import json
 from datetime import datetime
-
-from agents.base import call_llm, call_llm_with_tools
 from config.settings import air_config
+
+# ── All tools (sensor + action) gathered into one flat list ─────────────────
 from tools.sensor_tools import (
     fetch_ground_sensor_data,
     fetch_satellite_imagery,
@@ -46,965 +49,802 @@ from tools.action_tools import (
     get_action_log,
 )
 
+ALL_TOOLS = [
+    # ── Observation tools ────────────────────────────────────────────────────
+    fetch_ground_sensor_data,       # Ground station PM2.5/NO2/SO2/O3 readings
+    fetch_satellite_imagery,        # Sentinel-5P / MODIS / Landsat observations
+    fetch_meteorological_data,      # Wind, mixing height, stability class
+    fetch_emission_inventory,       # Registered emission sources & compliance
+    fetch_health_risk_tables,       # Population, vulnerable groups, C-R coefficients
+    # ── Action tools ─────────────────────────────────────────────────────────
+    log_mitigation_recommendation,  # Log a prioritised action plan item
+    issue_public_health_alert,      # Publish advisory/warning/alert/emergency
+    issue_regulatory_action,        # Issue NOV or shutdown order
+    notify_hospital_network,        # Alert ED / hospital command
+    request_traffic_restriction,    # Submit LEZ / diesel ban / HGV curfew
+    get_action_log,                 # Review what has already been logged
+]
 
-# ---------------------------------------------------------------------------
-# Helper
-# ---------------------------------------------------------------------------
-
-def _safe_json(obj) -> str:
-    try:
-        return json.dumps(obj, indent=2, default=str)
-    except Exception:
-        return str(obj)
+# ── Maximum loop iterations before forcing a stop ───────────────────────────
+MAX_ITERATIONS = 20
 
 
-# ---------------------------------------------------------------------------
-# Agent 1: Supervisor — initialization
-# ---------------------------------------------------------------------------
+# ============================================================================
+# ReAct System Prompt
+# ============================================================================
+# This replaces the nine separate system prompts that each linear agent held.
+# One prompt, all domain knowledge, full autonomy over tool order.
 
-def supervisor_init_agent(state: dict) -> dict:
+REACT_SYSTEM_PROMPT = f"""You are the Air Quality Monitoring ReAct Agent for {air_config.city}.
+
+You have access to five observation tools and five action tools.
+Your job is to:
+  1. Gather all data needed to understand the current air quality situation.
+  2. Issue appropriate mitigation recommendations, public alerts, and regulatory actions.
+  3. Produce a final structured SITUATION REPORT.
+
+═══════════════════════════════════════════════════════════
+OBSERVATION TOOLS — call these to gather data
+═══════════════════════════════════════════════════════════
+fetch_ground_sensor_data(scenario)
+  → All station PM2.5, PM10, NO2, SO2, CO, O3 readings + AQI per station.
+  → ALWAYS call this first. It gives you the primary pollution picture.
+
+fetch_satellite_imagery(scenario)
+  → Sentinel-5P / MODIS AOD, NO2/SO2 columns, fire count, plume detection.
+  → Call this after ground sensors to cross-validate and identify hotspots.
+
+fetch_meteorological_data(scenario)
+  → Wind speed/direction, mixing height, Pasquill-Gifford stability class.
+  → Ventilation coefficient < 3000 m²/s = very poor dispersion = accumulation risk.
+  → Call this to understand whether pollution will disperse or accumulate.
+
+fetch_emission_inventory()
+  → All registered emission sources, compliance status, primary pollutants.
+  → Call this to identify which facilities may be driving exceedances.
+
+fetch_health_risk_tables()
+  → District population, sensitive groups, C-R coefficients for PM2.5/NO2.
+  → Call this to estimate how many people are at risk and at what severity.
+
+═══════════════════════════════════════════════════════════
+ACTION TOOLS — call these to respond to the situation
+═══════════════════════════════════════════════════════════
+log_mitigation_recommendation(priority, category, target_entity, title,
+    description, expected_aqi_reduction, implementation_timeline,
+    regulatory_basis, estimated_cost_tier, co_benefits)
+  → Log a structured action-plan item.
+  → Priority: 'emergency' | 'high' | 'medium' | 'low'
+  → Category: 'regulatory' | 'traffic' | 'public_health' | 'operational' | 'infrastructure'
+
+issue_public_health_alert(severity, affected_districts, aqi_level,
+    dominant_pollutant, health_message, recommended_actions,
+    sensitive_groups_warning, duration_hours, channels)
+  → severity: 'advisory' (AQI 101-150) | 'warning' (151-200) |
+              'alert' (201-300) | 'emergency' (>300)
+
+issue_regulatory_action(source_id, source_name, violation_type,
+    pollutant, measured_concentration, permitted_limit,
+    action_type, required_action, compliance_deadline,
+    enforcement_authority, regulatory_basis)
+  → action_type: 'notice_of_violation' | 'compliance_order' | 'emergency_shutdown_order'
+
+notify_hospital_network(alert_level, affected_districts, primary_pollutant,
+    aqi, expected_case_types, expected_volume_increase_pct, special_instructions)
+  → alert_level: 'normal' | 'elevated' | 'high' | 'critical'
+
+request_traffic_restriction(restriction_type, affected_zones, vehicles_affected,
+    start_time, end_time, reason, legal_basis)
+  → restriction_type: 'low_emission_zone' | 'diesel_ban' | 'hgv_ban' | 'odd_even'
+
+get_action_log(limit)
+  → Review everything logged so far in this session.
+
+═══════════════════════════════════════════════════════════
+REASONING STRATEGY
+═══════════════════════════════════════════════════════════
+Think step by step before each tool call. After each observation, reason about:
+  - What does this data tell me?
+  - Is this consistent with other readings I have?
+  - Do I need more data before acting?
+  - What is the most severe problem I should address first?
+
+DECISION TREE FOR ACTIONS:
+  max AQI > 300 (Hazardous)  → emergency_shutdown_order, emergency alert, CRITICAL hospital alert
+  max AQI 201-300 (Very Unhealthy) → compliance_order, alert severity, high hospital alert
+  max AQI 151-200 (Unhealthy) → notice_of_violation for non-compliant sources, warning severity
+  max AQI 101-150 (Unhealthy for Sensitive Groups) → advisory severity, elevated hospital alert
+  
+  Non-compliant sources → always issue regulatory_action for each one
+  Ventilation coefficient < 3000 → add HGV curfew recommendation
+  Active fires > 5 → add agricultural burn alert in public health advisory
+  Sensitive district population > 50000 → notify hospitals regardless of AQI
+
+═══════════════════════════════════════════════════════════
+STOPPING CRITERION
+═══════════════════════════════════════════════════════════
+Stop calling tools and write your final answer when ALL of the following are true:
+  ✓ You have called all five observation tools at least once
+  ✓ You have issued at least one public health alert (if AQI > 100)
+  ✓ You have issued regulatory actions for all non-compliant sources found
+  ✓ You have logged at least one mitigation recommendation
+
+═══════════════════════════════════════════════════════════
+FINAL SITUATION REPORT FORMAT
+═══════════════════════════════════════════════════════════
+Write your final report with these sections:
+
+SECTION 1: EXECUTIVE SUMMARY
+SECTION 2: CURRENT AIR QUALITY STATUS  (max AQI, avg AQI, worst stations, dominant pollutants)
+SECTION 3: POLLUTION SOURCE ATTRIBUTION (which sources are driving it, compliance status)
+SECTION 4: HEALTH IMPACT ASSESSMENT    (population at risk, sensitive groups, hospital level)
+SECTION 5: METEOROLOGICAL ASSESSMENT   (dispersion quality, 12h forecast)
+SECTION 6: ACTIONS TAKEN               (summary of all tools you called)
+SECTION 7: OUTSTANDING PRIORITY ACTIONS
+
+Conclude with:  OVERALL RISK LEVEL: CRITICAL | HIGH | ELEVATED | MODERATE | LOW
+                OVERALL AQI FORECAST (next 6 hours): <value>
+
+Disclaimer: {air_config.disclaimer}
+"""
+
+
+# ============================================================================
+# Core ReAct loop (live LLM path)
+# ============================================================================
+
+def run_react_agent(scenario: str = "standard") -> dict:
     """
-    Opens the analysis cycle. Sets timestamp, logs the target region,
-    and prints the session header. No LLM call required.
+    Run the ReAct agent loop.
+
+    Returns a state dict compatible with the original linear pipeline's
+    output format so main.py / print_report_section() needs zero changes.
+
+    Args:
+        scenario: 'standard' or 'episode'
+
+    Returns:
+        dict with all state fields populated
     """
+    from agents.base import _demo_mode
+
+    state = _make_empty_state(scenario)
+
     print("\n" + "=" * 70)
-    print(f"  {air_config.system_name}")
+    print(f"  {air_config.system_name} — ReAct Mode")
     print(f"  {air_config.city} | {air_config.region}")
     print(f"  Analysis started: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    scenario = state.get("target_region", "standard")
     print(f"  Scenario: {scenario.upper()}")
+    print(f"  Mode: {'DEMO (no API key)' if _demo_mode() else 'LIVE LLM — GPT-4o'}")
     print("=" * 70)
 
-    state["analysis_timestamp"] = datetime.now().isoformat()
-    state["iteration_count"]    = state.get("iteration_count", 0) + 1
-    state["current_agent"]      = "ground_sensor_agent"
-    return state
+    if _demo_mode():
+        return _demo_react_run(state, scenario)
+
+    return _live_react_run(state, scenario)
 
 
-# ---------------------------------------------------------------------------
-# Agent 2: Ground Sensor Agent
-# ---------------------------------------------------------------------------
+# ── Live LLM path ────────────────────────────────────────────────────────────
 
-GROUND_SENSOR_SYSTEM = """You are the Ground Sensor Analysis Agent for an urban air quality
-monitoring network. Your role is to:
-
-1. Ingest real-time readings from all ground monitoring stations in the network.
-2. Identify stations that are exceeding WHO guidelines or EPA regulatory limits.
-3. Analyze spatial patterns — which districts are worst affected, which are clean.
-4. Identify the dominant pollutants driving AQI exceedances at each station.
-5. Compare current readings to station type norms (traffic, industrial, background).
-6. Flag stations with data quality issues.
-
-Output a structured analysis with:
-- Network-wide AQI status (overall risk level)
-- Station-by-station summary of exceedances
-- Spatial pattern assessment (downwind clustering, district-level gradients)
-- Priority stations requiring immediate attention
-- Comparison against WHO AQI guidelines:
-    PM2.5 24h limit: 15 ug/m3  |  PM10 24h limit: 45 ug/m3
-    NO2 1h limit: 200 ug/m3    |  SO2 24h limit: 40 ug/m3
-    CO 8h limit: 4 mg/m3       |  O3 8h limit: 100 ug/m3
-
-Be precise with numbers. Identify which stations are in which AQI category.
-Do not hedge — if a station is at hazardous levels, say so explicitly."""
-
-def ground_sensor_agent(state: dict) -> dict:
+def _live_react_run(state: dict, scenario: str) -> dict:
     """
-    Fetches all ground station readings and produces a network-wide analysis.
-    """
-    print("\n[GROUND SENSOR AGENT] Fetching ground station data...")
-    scenario = state.get("target_region", "standard")
+    Full ReAct loop with a live LLM.
 
-    sensor_data, tool_results = call_llm_with_tools(
-        system_prompt=GROUND_SENSOR_SYSTEM,
-        user_message=(
-            f"Fetch and analyze all ground station data for scenario: {scenario}. "
-            f"SCENARIO={scenario}. "
-            "Use the fetch_ground_sensor_data tool to retrieve current readings, "
-            "then produce a complete network status analysis."
-        ),
-        tools=[fetch_ground_sensor_data],
+    The LLM is given all tools at once via bind_tools().
+    We loop until the model produces a message with no tool_calls.
+    Each tool result is fed back as a ToolMessage so the LLM can reason
+    over its own observations before deciding what to call next.
+    """
+    try:
+        from langchain_openai import ChatOpenAI
+        from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+    except ImportError as e:
+        print(f"  [ERROR] LangChain not installed: {e}")
+        return _demo_react_run(state, scenario)
+
+    llm = ChatOpenAI(
+        model=air_config.model_name,
+        temperature=air_config.temperature,
+        api_key=air_config.openai_api_key,
+        max_tokens=2000,
     )
 
-    # Extract raw readings from tool results for downstream agents
-    raw_readings = []
-    for tr in tool_results:
-        if tr.get("tool") == "fetch_ground_sensor_data" and isinstance(tr.get("result"), dict):
-            raw_readings = tr["result"].get("stations", [])
-            break
+    # Bind ALL tools to the LLM — it can now call any of them at any point
+    llm_with_tools = llm.bind_tools(ALL_TOOLS)
 
-    # Fallback: call directly when demo mode returns no tool results
-    if not raw_readings:
-        try:
-            result = fetch_ground_sensor_data.invoke({"scenario": scenario})
-            if isinstance(result, dict):
-                raw_readings = result.get("stations", [])
-        except Exception:
-            pass
-
-    # Compute summary statistics for downstream agents
-    if raw_readings:
-        max_aqi   = max(r["aqi"] for r in raw_readings)
-        avg_aqi   = round(sum(r["aqi"] for r in raw_readings) / len(raw_readings), 1)
-        critical  = [r for r in raw_readings if r["aqi_category"] in ("unhealthy", "very_unhealthy", "hazardous")]
-        dom_pols  = {}
-        for r in raw_readings:
-            dp = r.get("dominant_pollutant", "Unknown")
-            dom_pols[dp] = dom_pols.get(dp, 0) + 1
-        overall_dominant = max(dom_pols, key=dom_pols.get) if dom_pols else "Unknown"
-
-        print(f"  Network AQI: max={max_aqi}, avg={avg_aqi}, critical stations={len(critical)}")
-
-        state["ground_readings"]  = raw_readings
-        state["ground_analysis"]  = sensor_data
-        state["risk_scores"].append({
-            "domain":   "ground_sensors",
-            "max_aqi":  max_aqi,
-            "avg_aqi":  avg_aqi,
-            "level":    critical[0]["aqi_category"] if critical else raw_readings[0]["aqi_category"],
-            "dominant_pollutant": overall_dominant,
-            "critical_station_count": len(critical),
-        })
-        if max_aqi >= air_config.aqi_very_unhealthy:
-            state["emergency_triggered"] = True
-            print("  *** EMERGENCY THRESHOLD EXCEEDED — emergency flag set ***")
-    else:
-        state["ground_analysis"] = sensor_data
-
-    state["current_agent"] = "satellite_agent"
-    return state
-
-
-# ---------------------------------------------------------------------------
-# Agent 3: Satellite Analysis Agent
-# ---------------------------------------------------------------------------
-
-SATELLITE_SYSTEM = """You are the Satellite Data Analysis Agent for an air pollution
-monitoring system. You process satellite imagery and atmospheric column data to:
-
-1. Analyze aerosol optical depth (AOD) to estimate column-integrated PM2.5 levels.
-   AOD > 0.4 indicates moderate to heavy aerosol loading.
-   AOD > 0.7 indicates heavy pollution.
-   AOD > 1.0 indicates very heavy or hazardous conditions.
-
-2. Interpret Sentinel-5P TROPOMI NO2 and SO2 tropospheric column densities.
-   NO2 column > 6e-5 mol/m2 indicates significant urban/industrial emission.
-   SO2 column > 5 Dobson Units indicates a significant industrial or volcanic source.
-
-3. Identify pollution plumes: origin, transport direction, and affected downwind areas.
-
-4. Detect active fires from MODIS thermal anomalies and fire radiative power.
-   Fire radiative power > 50 MW indicates a significant fire contributing to PM2.5.
-
-5. Identify pollution hotspots and rank them by intensity.
-
-6. Cross-validate satellite columns against ground station readings where possible.
-
-Always quantify what you observe. Specify coordinates, intensity indices, and
-transport vectors. Distinguish between industrial plumes and biomass burning
-signatures (SO2-dominant = industrial; PM2.5-dominant without SO2 = biomass/traffic)."""
-
-def satellite_agent(state: dict) -> dict:
-    """
-    Processes satellite observations for hotspot detection and plume tracking.
-    """
-    print("\n[SATELLITE AGENT] Processing satellite imagery...")
-    scenario = state.get("target_region", "standard")
-
-    analysis, tool_results = call_llm_with_tools(
-        system_prompt=SATELLITE_SYSTEM,
-        user_message=(
-            f"Retrieve and analyze satellite imagery for scenario: {scenario}. SCENARIO={scenario}. "
-            "Use fetch_satellite_imagery to get current observations. "
-            "Identify all pollution hotspots, plume origins, and any fire events. "
-            "Cross-reference satellite columns with ground readings if available:\n"
-            f"{_safe_json(state.get('ground_readings', [])[:3])}"
-        ),
-        tools=[fetch_satellite_imagery],
-    )
-
-    sat_obs = []
-    for tr in tool_results:
-        if tr.get("tool") == "fetch_satellite_imagery" and isinstance(tr.get("result"), dict):
-            sat_obs = tr["result"].get("observations", [])
-            break
-
-    if not sat_obs:
-        try:
-            result = fetch_satellite_imagery.invoke({"scenario": scenario})
-            if isinstance(result, dict):
-                sat_obs = result.get("observations", [])
-        except Exception:
-            pass
-
-    if sat_obs:
-        max_aod    = max(o.get("aerosol_optical_depth", 0) for o in sat_obs if o.get("aerosol_optical_depth"))
-        fire_count = sum(o.get("active_fire_count", 0) for o in sat_obs)
-        plumes     = sum(1 for o in sat_obs if o.get("plume_detected"))
-        print(f"  Max AOD: {max_aod:.3f}, Active fires: {fire_count}, Plumes detected: {plumes}")
-
-        state["satellite_observations"] = sat_obs
-        state["risk_scores"].append({
-            "domain":            "satellite",
-            "max_aod":           max_aod,
-            "fire_count":        fire_count,
-            "plumes_detected":   plumes,
-            "level":             "hazardous" if max_aod > 0.8 else "very_unhealthy" if max_aod > 0.6
-                                 else "unhealthy" if max_aod > 0.4 else "moderate",
-        })
-
-    state["satellite_analysis"] = analysis
-    state["current_agent"]      = "meteorological_agent"
-    return state
-
-
-# ---------------------------------------------------------------------------
-# Agent 4: Meteorological Agent
-# ---------------------------------------------------------------------------
-
-MET_SYSTEM = """You are the Meteorological and Dispersion Analysis Agent. You assess
-atmospheric conditions to understand how pollution disperses (or accumulates) and
-to identify transport pathways from sources to receptors.
-
-Your analysis must cover:
-
-1. Ventilation coefficient assessment:
-   VC = wind_speed (m/s) x mixing_height (m)
-   VC < 3000 m2/s : critical accumulation conditions
-   VC 3000-6000   : poor — high risk of episode development
-   VC 6000-12000  : moderate
-   VC > 12000     : good dispersion
-
-2. Pasquill-Gifford stability class interpretation:
-   Class A-B: very unstable — rapid dispersion, low ground-level concentrations
-   Class C-D: neutral — moderate dispersion
-   Class E-F: stable — pollution trapped near surface, very high risk
-
-3. Wind direction and transport analysis:
-   Identify which emission sources are upwind of which monitoring stations.
-   Trace the transport pathway: source -> plume -> receptor.
-
-4. Mixing height and boundary layer assessment:
-   Mixing height < 500m indicates a shallow trapped layer.
-   Combined with low wind: classic pollution episode conditions.
-
-5. Provide a dispersion forecast for the next 12 hours based on met trends.
-
-Be quantitative. State exact wind speeds, directions, mixing heights, and VC values."""
-
-def meteorological_agent(state: dict) -> dict:
-    """
-    Analyzes meteorological conditions to assess dispersion quality and
-    identify transport pathways linking sources to receptors.
-    """
-    print("\n[METEOROLOGICAL AGENT] Analyzing dispersion conditions...")
-    scenario = state.get("target_region", "standard")
-
-    analysis, tool_results = call_llm_with_tools(
-        system_prompt=MET_SYSTEM,
-        user_message=(
-            f"Retrieve and analyze meteorological data for scenario: {scenario}. SCENARIO={scenario}. "
-            "Use fetch_meteorological_data to get current conditions. "
-            "Identify dispersion quality, stability class, and transport pathways. "
-            "Consider the emission sources and ground readings already collected:\n"
-            f"Ground max AQI: {max((r.get('aqi', 0) for r in state.get('ground_readings', [])), default='N/A')}\n"
-            f"Satellite plumes: {sum(1 for o in state.get('satellite_observations', []) if o.get('plume_detected'))}"
-        ),
-        tools=[fetch_meteorological_data],
-    )
-
-    met_raw = {}
-    for tr in tool_results:
-        if tr.get("tool") == "fetch_meteorological_data" and isinstance(tr.get("result"), dict):
-            met_raw = tr["result"]
-            break
-
-    if not met_raw:
-        try:
-            met_raw = fetch_meteorological_data.invoke({"scenario": scenario})
-            if not isinstance(met_raw, dict):
-                met_raw = {}
-        except Exception:
-            met_raw = {}
-
-    if met_raw:
-        vc    = met_raw.get("ventilation_coefficient_m2_s", 0)
-        stab  = met_raw.get("stability_class", "D")
-        disp  = met_raw.get("dispersion_quality", "moderate")
-        print(f"  Ventilation coeff: {vc} m2/s, Stability: {stab}, Dispersion: {disp}")
-
-        state["meteorological_summary"] = met_raw
-        state["risk_scores"].append({
-            "domain":                     "meteorology",
-            "ventilation_coefficient":    vc,
-            "stability_class":            stab,
-            "dispersion_quality":         disp,
-            "level":                      met_raw.get("pollution_accumulation_risk", "moderate"),
-        })
-
-    state["met_analysis"]  = analysis
-    state["current_agent"] = "source_identification_agent"
-    return state
-
-
-# ---------------------------------------------------------------------------
-# Agent 5: Source Identification Agent
-# ---------------------------------------------------------------------------
-
-SOURCE_SYSTEM = """You are the Pollution Source Identification Agent. Using ground sensor
-readings, satellite observations, meteorological transport analysis, and the emission
-inventory, your task is to attribute observed pollution to specific sources.
-
-Source attribution methodology:
-1. Receptor modeling: which inventory sources are upwind of stations showing exceedances?
-2. Chemical fingerprinting: SO2-rich plumes -> industrial/combustion; 
-   high NOx/CO ratio -> vehicular; high PM10 without SO2 -> construction/agriculture.
-3. Satellite hotspot correlation: do satellite intensity hotspots coincide with
-   inventory source locations?
-4. Gradient analysis: pollution levels highest near source, decreasing downwind.
-5. Compliance cross-check: flag sources with existing non-compliant status.
-
-For each attributed source provide:
-- Source ID and name
-- Primary pollutants attributed to this source
-- Estimated contribution % to current network AQI
-- Confidence level (high/medium/low) with justification
-- Compliance status and urgency of regulatory response needed
-
-Rank sources by estimated contribution and urgency."""
-
-def source_identification_agent(state: dict) -> dict:
-    """
-    Cross-references ground data, satellite imagery, meteorology, and the
-    emission inventory to identify and rank pollution sources.
-    """
-    print("\n[SOURCE IDENTIFICATION AGENT] Running source attribution analysis...")
-
-    ground_summary  = _safe_json(state.get("ground_readings", [])[:4])
-    satellite_hs    = []
-    for obs in state.get("satellite_observations", []):
-        satellite_hs.extend(obs.get("pollution_hotspots", []))
-    met_wind        = state.get("meteorological_summary", {}).get("wind_direction_deg", "unknown")
-    met_vc          = state.get("meteorological_summary", {}).get("ventilation_coefficient_m2_s", "unknown")
-
-    analysis, tool_results = call_llm_with_tools(
-        system_prompt=SOURCE_SYSTEM,
-        user_message=(
-            "Retrieve the emission inventory and perform source attribution. "
-            "Use fetch_emission_inventory to get all registered sources. "
-            f"\n\nAvailable context:"
-            f"\nWind direction: {met_wind} degrees"
-            f"\nVentilation coefficient: {met_vc} m2/s"
-            f"\nSatellite hotspots: {_safe_json(satellite_hs[:5])}"
-            f"\nHighest AQI stations (sample): {ground_summary}"
-            f"\nPrevious meteorological analysis: {str(state.get('met_analysis', ''))[:400]}"
-        ),
-        tools=[fetch_emission_inventory],
-    )
-
-    inventory_sources = []
-    for tr in tool_results:
-        if tr.get("tool") == "fetch_emission_inventory" and isinstance(tr.get("result"), dict):
-            inventory_sources = tr["result"].get("sources", [])
-            break
-
-    if not inventory_sources:
-        try:
-            result = fetch_emission_inventory.invoke({})
-            if isinstance(result, dict):
-                inventory_sources = result.get("sources", [])
-        except Exception:
-            pass
-
-    if inventory_sources:
-        non_compliant = [s for s in inventory_sources if s.get("compliance_status") != "compliant"]
-        print(f"  Inventory sources: {len(inventory_sources)}, Non-compliant: {len(non_compliant)}")
-        state["pollution_sources"] = inventory_sources
-        state["risk_scores"].append({
-            "domain":              "source_attribution",
-            "total_sources":       len(inventory_sources),
-            "non_compliant":       len(non_compliant),
-            "level":               "hazardous" if len(non_compliant) >= 3 else
-                                   "very_unhealthy" if len(non_compliant) == 2 else
-                                   "unhealthy" if len(non_compliant) == 1 else "moderate",
-        })
-
-    state["source_analysis"] = analysis
-    state["current_agent"]   = "health_impact_agent"
-    return state
-
-
-# ---------------------------------------------------------------------------
-# Agent 6: Health Impact Agent
-# ---------------------------------------------------------------------------
-
-HEALTH_SYSTEM = """You are the Public Health Impact Assessment Agent. Using current
-air quality levels, population exposure data, and WHO/EPA health impact methodology,
-you quantify the health burden and determine clinical risk levels.
-
-Health impact quantification framework:
-1. Identify all districts with AQI > 100 (unhealthy for sensitive groups).
-2. Apply population-weighted exposure:
-   exposed_population = district_population * affected_fraction
-   sensitive_pop = total_pop * sensitive_group_percentage
-3. Apply concentration-response coefficients (Pope & Dockery 2006):
-   Respiratory hospitalizations: +0.62% per 10 ug/m3 PM2.5 increase
-   Cardiovascular hospitalizations: +0.91% per 10 ug/m3 PM2.5 increase
-   All-cause mortality: +0.60% per 10 ug/m3 PM2.5 increase
-4. Assess sensitive group risk:
-   Groups at elevated risk: children under 12, adults over 65, asthma patients,
-   COPD patients, cardiovascular disease patients, pregnant women, outdoor workers
-5. Determine hospital alert level:
-   normal: AQI < 100  |  elevated: AQI 100-150  |  high: AQI 150-200  |  critical: AQI > 200
-6. Generate specific health advisories differentiated by group.
-
-Quantify everything. Provide estimated case counts, not just percentages.
-State which specific health outcomes are of concern for each pollutant."""
-
-def health_impact_agent(state: dict) -> dict:
-    """
-    Assesses public health burden, identifies at-risk populations,
-    and determines hospital preparedness level.
-    """
-    print("\n[HEALTH IMPACT AGENT] Calculating population health burden...")
-
-    aqi_values   = [r.get("aqi", 0) for r in state.get("ground_readings", [])]
-    max_aqi      = max(aqi_values) if aqi_values else 0
-    avg_aqi      = round(sum(aqi_values) / len(aqi_values), 1) if aqi_values else 0
-    pm25_readings = [r.get("pm25_ug_m3", 0) for r in state.get("ground_readings", [])]
-    max_pm25     = max(pm25_readings) if pm25_readings else 0
-
-    analysis, tool_results = call_llm_with_tools(
-        system_prompt=HEALTH_SYSTEM,
-        user_message=(
-            "Use fetch_health_risk_tables to retrieve population and vulnerability data. "
-            "Then assess health impacts using the following current air quality data:\n"
-            f"Network max AQI: {max_aqi}\n"
-            f"Network avg AQI: {avg_aqi}\n"
-            f"Max PM2.5: {max_pm25} ug/m3\n"
-            f"WHO PM2.5 24h guideline: {air_config.pm25_who_24h} ug/m3\n"
-            f"Emergency flag triggered: {state.get('emergency_triggered', False)}\n\n"
-            "Ground station AQI values by district:\n"
-            + "\n".join(
-                f"  {r['district']} ({r['station_type']}): AQI={r['aqi']} ({r['aqi_category']}), "
-                f"PM2.5={r['pm25_ug_m3']}, NO2={r['no2_ug_m3']}, SO2={r['so2_ug_m3']}"
-                for r in state.get("ground_readings", [])
-            )
-        ),
-        tools=[fetch_health_risk_tables],
-    )
-
-    # Derive structured health impact data for the report
-    if max_aqi >= air_config.aqi_hazardous:
-        hospital_level = "critical"
-    elif max_aqi >= air_config.aqi_very_unhealthy:
-        hospital_level = "high"
-    elif max_aqi >= air_config.aqi_unhealthy:
-        hospital_level = "elevated"
-    else:
-        hospital_level = "normal"
-
-    state["health_analysis"] = analysis
-    state["health_impact"]   = {
-        "max_aqi":                max_aqi,
-        "avg_aqi":                avg_aqi,
-        "max_pm25_ug_m3":         max_pm25,
-        "hospital_alert_level":   hospital_level,
-        "emergency_response":     state.get("emergency_triggered", False),
+    # Tool lookup by name for dispatching
+    tool_map = {
+        getattr(t, "name", getattr(t, "__name__", str(t))): t
+        for t in ALL_TOOLS
     }
-    state["risk_scores"].append({
-        "domain":               "health",
-        "max_aqi":              max_aqi,
-        "hospital_alert_level": hospital_level,
-        "level":                hospital_level,
+
+    # Initial conversation: system prompt + task description
+    messages = [
+        SystemMessage(content=REACT_SYSTEM_PROMPT),
+        HumanMessage(content=(
+            f"Analyse the current air quality situation for scenario='{scenario}'. "
+            f"Gather all required data, issue appropriate actions, and produce "
+            f"the final situation report. Begin by fetching ground sensor data."
+        )),
+    ]
+
+    tool_results_log = []
+    iteration = 0
+
+    print(f"\n[REACT AGENT] Starting ReAct loop (max {MAX_ITERATIONS} iterations)...")
+
+    while iteration < MAX_ITERATIONS:
+        iteration += 1
+        print(f"\n  [Iteration {iteration}] Calling LLM...")
+
+        response = llm_with_tools.invoke(messages)
+        messages.append(response)
+
+        # ── No tool calls → LLM is done, response.content is the final report ──
+        if not response.tool_calls:
+            print(f"\n  [REACT AGENT] Loop complete after {iteration} iterations.")
+            print(f"  Tools called: {len(tool_results_log)}")
+            state["situation_report"] = response.content
+            state = _extract_state_from_tool_log(state, tool_results_log, scenario)
+            _print_completion_summary(state, iteration)
+            return state
+
+        # ── Execute each requested tool call ──────────────────────────────────
+        for tc in response.tool_calls:
+            tool_name = tc["name"]
+            tool_args = tc.get("args", {})
+
+            print(f"  → Tool call: {tool_name}({_fmt_args(tool_args)})")
+
+            t = tool_map.get(tool_name)
+            if not t:
+                result_str = f"Error: unknown tool '{tool_name}'"
+                result_obj = {"error": result_str}
+            else:
+                try:
+                    result_obj = t.invoke(tool_args)
+                    result_str = json.dumps(result_obj, default=str)
+                except Exception as ex:
+                    result_str = f"Tool error: {ex}"
+                    result_obj = {"error": str(ex)}
+
+            tool_results_log.append({
+                "tool":   tool_name,
+                "args":   tool_args,
+                "result": result_obj,
+            })
+
+            # Feed the observation back to the LLM as a ToolMessage
+            messages.append(ToolMessage(
+                content=result_str,
+                tool_call_id=tc["id"],
+            ))
+
+    # ── Max iterations reached: force a synthesis call without tools ──────────
+    print(f"\n  [REACT AGENT] Max iterations ({MAX_ITERATIONS}) reached. Forcing synthesis.")
+    state = _extract_state_from_tool_log(state, tool_results_log, scenario)
+
+    summary_msg = HumanMessage(content=(
+        "You have reached the maximum number of tool calls. "
+        "Write your final SITUATION REPORT now based on all data collected so far. "
+        "Do NOT call any more tools."
+    ))
+    messages.append(summary_msg)
+
+    # Re-invoke without tools bound so the LLM cannot make more tool calls
+    plain_llm = ChatOpenAI(
+        model=air_config.model_name,
+        temperature=air_config.temperature,
+        api_key=air_config.openai_api_key,
+        max_tokens=2000,
+    )
+    final_response = plain_llm.invoke(messages)
+    state["situation_report"] = final_response.content
+    _print_completion_summary(state, iteration)
+    return state
+
+
+# ── Demo path (no API key) ────────────────────────────────────────────────────
+
+def _demo_react_run(state: dict, scenario: str) -> dict:
+    """
+    Deterministic demo mode.
+
+    Simulates the ReAct loop by calling every observation tool in a logical
+    order and then every applicable action tool, without an LLM.
+
+    This demonstrates the ReAct pattern's key property: the tool call sequence
+    is data-driven. In live mode the LLM makes these same decisions dynamically.
+    """
+    print("\n  [DEMO MODE] Simulating ReAct loop (no API key)...")
+    print("  In live mode the LLM selects tools dynamically based on observations.\n")
+
+    tool_results_log = []
+
+    def _call(tool, **kwargs):
+        name = getattr(tool, "name", None) or getattr(tool, "__name__", str(tool))
+        print(f"  [ReAct] Thought: I need data from {name}.")
+        try:
+            # Support both LangChain tool objects (.invoke) and plain functions
+            fn = getattr(tool, "func", tool)   # .func unwraps LangChain @tool wrappers
+            if hasattr(tool, "invoke") and kwargs:
+                result = tool.invoke(kwargs)
+            elif hasattr(tool, "invoke"):
+                result = tool.invoke({})
+            elif kwargs:
+                result = fn(**kwargs)
+            else:
+                result = fn()
+        except Exception as ex:
+            result = {"error": str(ex)}
+        print(f"  [ReAct] Observation: {_summarise(name, result)}")
+        tool_results_log.append({"tool": name, "args": kwargs, "result": result})
+        return result
+
+    # ── PHASE 1: Observations (data gathering) ────────────────────────────────
+    print("  ── Phase 1: Observation ──")
+
+    ground = _call(fetch_ground_sensor_data, scenario=scenario)
+    sat    = _call(fetch_satellite_imagery,  scenario=scenario)
+    met    = _call(fetch_meteorological_data, scenario=scenario)
+    inv    = _call(fetch_emission_inventory)
+    health = _call(fetch_health_risk_tables)
+
+    # ── PHASE 2: Reasoning ────────────────────────────────────────────────────
+    print("\n  ── Phase 2: Reasoning ──")
+
+    max_aqi         = ground.get("network_max_aqi", 0)
+    avg_aqi         = ground.get("network_avg_aqi", 0)
+    critical_stns   = ground.get("critical_stations", [])
+    all_stations    = ground.get("stations", [])
+    non_compliant   = inv.get("non_compliant_sources", [])
+    vc              = met.get("ventilation_coefficient_m2_s", 9999)
+    fire_count      = sat.get("total_active_fire_count", 0)
+    disp_quality    = met.get("dispersion_quality", "good")
+    emergency       = max_aqi >= air_config.aqi_very_unhealthy
+
+    # Determine dominant pollutant across all stations
+    pol_counts: dict = {}
+    for stn in all_stations:
+        dp = stn.get("dominant_pollutant", "PM2.5")
+        pol_counts[dp] = pol_counts.get(dp, 0) + 1
+    dominant_pol = max(pol_counts, key=pol_counts.get) if pol_counts else "PM2.5"
+
+    # Districts with critical readings
+    critical_districts = list({
+        stn.get("district", "Unknown")
+        for stn in all_stations
+        if stn.get("aqi_category") in ("unhealthy", "very_unhealthy", "hazardous")
     })
 
-    print(f"  Max AQI: {max_aqi}, Hospital alert: {hospital_level.upper()}")
-    state["current_agent"] = "mitigation_agent"
-    return state
+    print(f"  max AQI={max_aqi}, dominant={dominant_pol}, "
+          f"non-compliant sources={len(non_compliant)}, "
+          f"VC={vc} m²/s ({disp_quality}), fires={fire_count}")
 
-
-# ---------------------------------------------------------------------------
-# Agent 7: Mitigation Agent
-# ---------------------------------------------------------------------------
-
-MITIGATION_SYSTEM = """You are the Pollution Mitigation Planning Agent. Based on all
-preceding analyses (ground sensors, satellite, meteorology, sources, health impact),
-you generate a prioritized action plan to reduce pollution and protect public health.
-
-For each recommendation you generate, use the log_mitigation_recommendation tool.
-Generate between 4 and 8 recommendations based on severity.
-
-Recommendation framework:
-
-EMERGENCY (AQI > 300 / hazardous):
-  - Emergency curtailment orders to highest-emitting non-compliant facilities
-  - Immediate traffic restrictions in most affected zones
-  - Emergency public alert issuance
-  - Hospital network activation
-
-HIGH (AQI 200-300 / very unhealthy):
-  - Regulatory compliance orders to facilities in exceedance
-  - Voluntary emission reduction requests to major point sources
-  - Public health advisory issuance
-  - School/outdoor event cancellation recommendations
-
-MEDIUM (AQI 150-200 / unhealthy for sensitive groups):
-  - Enhanced monitoring frequency at affected stations
-  - Low emission zone activation
-  - Sensitive group advisories
-  - Fleet emission compliance checks
-
-LOW (AQI 100-150 / moderate):
-  - Public information messaging
-  - Routine permit compliance monitoring
-  - Long-term infrastructure recommendations
-
-For each recommendation, quantify expected AQI reduction where possible.
-Be specific about which source, regulation, or intervention is targeted."""
-
-def mitigation_agent(state: dict) -> dict:
-    """
-    Generates and logs a prioritized mitigation action plan using tool calls.
-    """
-    print("\n[MITIGATION AGENT] Generating action plan...")
-
-    health  = state.get("health_impact", {})
-    max_aqi = health.get("max_aqi", 0)
-    met     = state.get("meteorological_summary", {})
-
-    non_compliant = [
-        s for s in state.get("pollution_sources", [])
-        if s.get("compliance_status") != "compliant"
-    ]
-
-    # Determine priority tier from AQI
-    if max_aqi >= air_config.aqi_hazardous:
-        priority_tier = "emergency"
-    elif max_aqi >= air_config.aqi_very_unhealthy:
-        priority_tier = "emergency"
-    elif max_aqi >= air_config.aqi_unhealthy:
-        priority_tier = "high"
-    elif max_aqi >= air_config.aqi_unhealthy_sensitive:
-        priority_tier = "medium"
+    if emergency:
+        print("  *** ReAct reasoning: emergency threshold exceeded → escalating all actions ***")
     else:
-        priority_tier = "low"
+        print(f"  ReAct reasoning: AQI {max_aqi} → {'elevated' if max_aqi > 100 else 'moderate'} response")
 
-    # Build demo recommendations directly from simulation data (no LLM required)
-    demo_recommendations = []
-    from datetime import datetime as _dt
+    # ── PHASE 3: Actions ──────────────────────────────────────────────────────
+    print("\n  ── Phase 3: Action ──")
 
-    def _make_rec(priority, category, target, title, desc, aqi_reduction,
-                  timeline, basis, cost, benefits):
-        rec_id = f"REC-{_dt.now().strftime('%H%M%S')}-{priority[0].upper()}{len(demo_recommendations)}"
-        rec = {
-            "recommendation_id":       rec_id,
-            "priority":                priority,
-            "category":                category,
-            "target_entity":           target,
-            "title":                   title,
-            "description":             desc,
-            "expected_aqi_reduction":  aqi_reduction,
-            "implementation_timeline": timeline,
-            "regulatory_basis":        basis,
-            "estimated_cost_tier":     cost,
-            "co_benefits":             benefits,
-        }
-        print(f"  [RECOMMENDATION - {priority.upper()}] {title} "
-              f"(expected AQI reduction: {aqi_reduction:.1f} pts, timeline: {timeline})")
-        return rec
+    # 3a. Mitigation recommendations
+    if emergency:
+        _call(log_mitigation_recommendation,
+              priority="emergency",
+              category="regulatory",
+              target_entity="regulator",
+              title="Initiate Emergency Episode Plan — Stage III",
+              description=(
+                  f"Network max AQI of {max_aqi} has triggered the emergency threshold "
+                  f"({air_config.aqi_very_unhealthy}). Activate Stage III of the Air Pollution "
+                  "Episode Plan: mandatory industrial curtailments, traffic restrictions, "
+                  "and public shelter-in-place advisory."
+              ),
+              expected_aqi_reduction=40.0,
+              implementation_timeline="immediate",
+              regulatory_basis="State AQMD Air Pollution Episode Plan — Stage III",
+              estimated_cost_tier="high",
+              co_benefits=["reduced acute health burden", "legal compliance"],
+        )
+    else:
+        _call(log_mitigation_recommendation,
+              priority="high" if max_aqi > 150 else "medium",
+              category="regulatory",
+              target_entity="regulator",
+              title="Issue Compliance Orders to Non-Compliant Emission Sources",
+              description=(
+                  f"Current network AQI of {max_aqi} correlates with emissions from "
+                  f"{len(non_compliant)} non-compliant source(s). Issue formal compliance "
+                  "orders requiring emission reductions within 24 hours."
+              ),
+              expected_aqi_reduction=10.0,
+              implementation_timeline="within_24h",
+              regulatory_basis="Clean Air Act Section 113 / State AQMD Regulation 2-1",
+              estimated_cost_tier="low",
+              co_benefits=["improved public health", "regulatory compliance"],
+        )
 
-    # Always add: recommendations calibrated to scenario severity
-    for nc_source in non_compliant[:2]:
-        action = "emergency_curtailment_order" if priority_tier == "emergency" else "compliance_order"
-        demo_recommendations.append(_make_rec(
-            priority=priority_tier,
-            category="regulatory",
-            target="regulator",
-            title=f"Issue {action.replace('_', ' ').title()} to {nc_source['source_name']}",
-            desc=(
-                f"{nc_source['source_name']} is currently in {nc_source['compliance_status']} status. "
-                f"Primary pollutants: {', '.join(nc_source['primary_pollutants'][:3])}. "
-                f"Require immediate emission reduction measures and compliance verification within 24 hours."
-            ),
-            aqi_reduction=12.0 if priority_tier == "emergency" else 7.0,
-            timeline="immediate" if priority_tier == "emergency" else "within_24h",
-            basis="Clean Air Act Section 113 / State AQMD Regulation 2-1",
-            cost="negligible",
-            benefits=["improved public health", "regulatory compliance restoration"],
-        ))
+    if max_aqi > 100:
+        _call(log_mitigation_recommendation,
+              priority="high",
+              category="traffic",
+              target_entity="city_transport",
+              title="Activate Low Emission Zone — Affected Districts",
+              description=(
+                  f"AQI of {max_aqi} and {disp_quality} dispersion conditions require "
+                  "vehicular emission controls. Restrict Euro 4 and older diesel vehicles "
+                  "from all critical-reading districts."
+              ),
+              expected_aqi_reduction=8.5,
+              implementation_timeline="within_24h",
+              regulatory_basis="Local Air Quality Management Order 2022, Section 4.2",
+              estimated_cost_tier="low",
+              co_benefits=["noise reduction", "traffic calming"],
+        )
 
+    if vc < 6000:
+        _call(log_mitigation_recommendation,
+              priority="medium",
+              category="infrastructure",
+              target_entity="city_transport",
+              title="HGV Curfew — Poor Dispersion Conditions",
+              description=(
+                  f"Ventilation coefficient of {vc} m²/s indicates poor to very poor dispersion. "
+                  "Suspend HGV operations on the South Highway Corridor 06:00-22:00 until "
+                  "ventilation coefficient exceeds 6000 m²/s."
+              ),
+              expected_aqi_reduction=5.5,
+              implementation_timeline="within_24h",
+              regulatory_basis="Road Traffic Regulation Act — Air Quality Emergency Provisions",
+              estimated_cost_tier="medium",
+              co_benefits=["noise reduction", "road safety"],
+        )
+
+    # 3b. Public health alert
     if max_aqi >= air_config.aqi_unhealthy_sensitive:
-        disp_quality = met.get("dispersion_quality", "poor")
-        demo_recommendations.append(_make_rec(
-            priority="high",
-            category="traffic",
-            target="city_transport",
-            title="Activate Low Emission Zone — Downtown Core and East Industrial District",
-            desc=(
-                f"Current AQI {max_aqi} and {disp_quality} dispersion conditions require "
-                "vehicular emission controls. Activate LEZ restricting diesel vehicles older "
-                "than Euro 5 standard from Downtown Core and adjacent corridors."
-            ),
-            aqi_reduction=8.5,
-            timeline="within_24h",
-            basis="Local Air Quality Management Order 2022, Section 4.2",
-            cost="low",
-            benefits=["noise reduction", "traffic calming", "fuel savings for compliant vehicles"],
-        ))
+        alert_severity = (
+            "emergency" if max_aqi > 300 else
+            "alert"     if max_aqi > 200 else
+            "warning"   if max_aqi > 150 else
+            "advisory"
+        )
+        _call(issue_public_health_alert,
+              severity=alert_severity,
+              affected_districts=critical_districts or ["Downtown Core"],
+              aqi_level=max_aqi,
+              dominant_pollutant=dominant_pol,
+              health_message=(
+                  f"Air quality has reached {alert_severity.upper()} level (AQI {max_aqi}). "
+                  f"The dominant pollutant is {dominant_pol}. "
+                  "Prolonged outdoor exposure poses a health risk, particularly for vulnerable groups."
+              ),
+              recommended_actions=[
+                  "Avoid prolonged outdoor exercise",
+                  "Keep windows closed",
+                  "Wear an N95 mask if outdoor activity is unavoidable",
+                  "Check AQI before travelling",
+              ],
+              sensitive_groups_warning=(
+                  "Children, elderly, and those with asthma or cardiovascular disease "
+                  "should remain indoors and keep rescue inhalers accessible."
+              ),
+              duration_hours=12,
+              channels=["mobile_app", "sms", "website", "digital_signage", "media"],
+        )
 
-    demo_recommendations.append(_make_rec(
-        priority="high" if max_aqi >= 150 else "medium",
-        category="public_health",
-        target="public",
-        title="Issue Public Health Advisory for Sensitive Populations",
-        desc=(
-            f"AQI of {max_aqi} ({health.get('hospital_alert_level', 'elevated')} risk level) "
-            "requires a public advisory. Advise: avoid prolonged outdoor exercise; "
-            "sensitive groups (children, elderly, respiratory patients) to remain indoors; "
-            "schools to cancel outdoor activities."
-        ),
-        aqi_reduction=0.0,
-        timeline="immediate",
-        basis="WHO Air Quality Guidelines 2021 / State Public Health Emergency Protocol",
-        cost="negligible",
-        benefits=["reduced emergency department visits", "reduced acute health burden"],
-    ))
-
-    demo_recommendations.append(_make_rec(
-        priority="medium",
-        category="operational",
-        target="facility_operator",
-        title="Request Voluntary Emission Curtailment from Major Point Sources",
-        desc=(
-            "Request all industrial facilities within the East Industrial District and Port District "
-            "to voluntarily curtail non-essential combustion processes by 25% until AQI returns "
-            "below 100. Priority targets: Metro Chemical Works, Port Authority Terminal, Metro Power Station."
-        ),
-        aqi_reduction=15.0,
-        timeline="within_24h",
-        basis="State AQMD Air Pollution Episode Plan — Stage I Procedures",
-        cost="medium",
-        benefits=["energy savings", "reduced maintenance costs from lower combustion cycling"],
-    ))
-
-    if met.get("dispersion_quality") in ("very_poor", "poor"):
-        demo_recommendations.append(_make_rec(
-            priority="medium",
-            category="infrastructure",
-            target="city_transport",
-            title="Implement HGV Curfew — South Highway Corridor",
-            desc=(
-                f"Stagnant meteorological conditions (ventilation coefficient: "
-                f"{met.get('ventilation_coefficient_m2_s', 'N/A')} m2/s, "
-                f"stability class: {met.get('stability_class', 'N/A')}) "
-                "are preventing normal dispersion. Suspend heavy goods vehicle operations "
-                "on South Highway Corridor between 06:00-22:00 until conditions improve."
-            ),
-            aqi_reduction=5.5,
-            timeline="within_24h",
-            basis="Road Traffic Regulation Act — Air Quality Emergency Provisions",
-            cost="medium",
-            benefits=["noise reduction", "road safety improvement"],
-        ))
-
-    # Use LLM if available (will override demo recommendations)
-    try:
-        from agents.base import _demo_mode
-        if not _demo_mode():
-            analysis, tool_results = call_llm_with_tools(
-                system_prompt=MITIGATION_SYSTEM,
-                user_message=(
-                    "Generate a complete mitigation action plan using log_mitigation_recommendation. "
-                    f"Network max AQI: {max_aqi}\n"
-                    f"Hospital alert: {health.get('hospital_alert_level')}\n"
-                    f"Non-compliant sources: {[s['source_name'] for s in non_compliant]}\n"
-                    f"Dispersion: {met.get('dispersion_quality')}"
-                ),
-                tools=[log_mitigation_recommendation, request_traffic_restriction],
-            )
-            llm_recs = [
-                tr["result"] for tr in tool_results
-                if tr.get("tool") == "log_mitigation_recommendation" and isinstance(tr.get("result"), dict)
-            ]
-            if llm_recs:
-                demo_recommendations = llm_recs
-    except Exception:
-        pass
-
-    print(f"  Recommendations logged: {len(demo_recommendations)}")
-
-    state["mitigation_recommendations"] = demo_recommendations
-    state["current_agent"]              = "alert_agent"
-    return state
-
-
-# ---------------------------------------------------------------------------
-# Agent 8: Alert Agent
-# ---------------------------------------------------------------------------
-
-ALERT_SYSTEM = """You are the Public Alert and Regulatory Notification Agent.
-Based on the completed situation analysis, you issue:
-
-1. PUBLIC HEALTH ALERTS: Using issue_public_health_alert
-   - Determine severity: advisory (AQI 101-150), warning (151-200), alert (201-300), emergency (>300)
-   - Draft clear, non-technical health messages for the general public
-   - Provide specific action instructions (stay indoors, use masks, avoid exercise, etc.)
-   - Include specific guidance for sensitive groups (children, elderly, respiratory patients)
-   - Select appropriate distribution channels
-
-2. REGULATORY ENFORCEMENT ACTIONS: Using issue_regulatory_action
-   - For each non-compliant source, issue the appropriate enforcement action
-   - NOV (Notice of Violation) for initial exceedance
-   - Compliance Order for ongoing/repeated violations
-   - Emergency Shutdown Order for hazardous-level emissions
-
-3. HOSPITAL NETWORK NOTIFICATION: Using notify_hospital_network
-   - Always notify hospitals if AQI > 150
-   - Specify expected case types and volume increase estimate
-   - Provide clinical guidance for treating pollution-related conditions
-
-Issue all appropriate alerts and notifications. Do not omit any non-compliant
-source that requires regulatory action. Be thorough."""
-
-def alert_agent(state: dict) -> dict:
-    """
-    Issues public health alerts, regulatory enforcement actions, and
-    hospital network notifications.
-    """
-    print("\n[ALERT AGENT] Issuing alerts and regulatory notifications...")
-
-    health  = state.get("health_impact", {})
-    max_aqi = health.get("max_aqi", 0)
-    met     = state.get("meteorological_summary", {})
-
-    non_compliant = [
-        s for s in state.get("pollution_sources", [])
-        if s.get("compliance_status") != "compliant"
-    ]
-
-    # Determine alert severity
-    if max_aqi >= air_config.aqi_hazardous:
-        severity = "emergency"
-    elif max_aqi >= air_config.aqi_very_unhealthy:
-        severity = "alert"
-    elif max_aqi >= air_config.aqi_unhealthy:
-        severity = "warning"
-    elif max_aqi >= air_config.aqi_unhealthy_sensitive:
-        severity = "advisory"
-    else:
-        severity = "info"
-
-    hospital_level = health.get("hospital_alert_level", "normal")
-
-    # Dominant pollutant from ground readings
-    dom_pols = {}
-    for r in state.get("ground_readings", []):
-        dp = r.get("dominant_pollutant", "PM2.5")
-        dom_pols[dp] = dom_pols.get(dp, 0) + 1
-    dom_pol = max(dom_pols, key=dom_pols.get) if dom_pols else "PM2.5"
-
-    affected_districts = list(set(
-        r["district"] for r in state.get("ground_readings", [])
-        if r.get("aqi_category") not in ("good", "moderate")
-    ))
-
-    from datetime import datetime as _dt
-
-    # Issue public health alert
-    public_alerts = []
-    if max_aqi >= air_config.aqi_moderate:
-        alert_id = f"ALERT-{_dt.now().strftime('%Y%m%d-%H%M%S')}"
-        alert = {
-            "alert_id":            alert_id,
-            "severity":            severity,
-            "aqi_level":           max_aqi,
-            "dominant_pollutant":  dom_pol,
-            "districts_notified":  len(affected_districts),
-            "affected_districts":  affected_districts,
-            "channels":            ["mobile_app", "website", "sms", "digital_signage"],
-            "health_message": (
-                f"Air quality is currently {severity.upper()} in {', '.join(affected_districts[:3])}. "
-                f"AQI of {max_aqi} driven by elevated {dom_pol}. "
-                "Avoid prolonged outdoor activity. Sensitive groups should remain indoors."
-            ),
-            "issued_at": _dt.now().isoformat(),
-            "status": "issued",
-        }
-        public_alerts.append(alert)
-        print(f"  [PUBLIC ALERT - {severity.upper()}] AQI {max_aqi} ({dom_pol}) "
-              f"in {len(affected_districts)} district(s)")
-
-    # Issue regulatory enforcement actions
-    reg_actions = []
-    for nc in non_compliant:
-        if nc["compliance_status"] == "permit_exceeded":
-            action_type = "compliance_order"
-        elif nc["compliance_status"] == "exceedance" and max_aqi >= 200:
-            action_type = "emergency_shutdown_order"
+    # 3c. Regulatory actions for non-compliant sources
+    for source in non_compliant:
+        action = "emergency_shutdown_order" if emergency else "compliance_order"
+        primary_pol = source.get("primary_pollutants", ["PM2.5"])[0]
+        # emission_rate_kg_hr is a dict per-pollutant; extract the primary pollutant rate
+        rate_map = source.get("emission_rate_kg_hr", {})
+        if isinstance(rate_map, dict):
+            measured = float(rate_map.get(primary_pol, rate_map.get("PM2.5", 50.0)))
         else:
-            action_type = "notice_of_violation"
+            measured = float(rate_map or 50.0)
+        permitted = measured * 0.5  # assume limit is 50% of current for demo
+        _call(issue_regulatory_action,
+              source_id=source.get("source_id", "SRC-UNK"),
+              source_name=source.get("source_name", "Unknown Source"),
+              violation_type=source.get("compliance_status", "exceedance").replace(" ", "_"),
+              pollutant=primary_pol,
+              measured_concentration=float(measured),
+              permitted_limit=float(permitted),
+              action_type=action,
+              required_action=(
+                  "Immediate cessation of non-compliant emission activities. "
+                  "Submit hourly compliance reports to AQMD until normalised."
+                  if emergency else
+                  "Reduce emission rates to permitted limits within 24 hours. "
+                  "Submit compliance confirmation within 48 hours."
+              ),
+              compliance_deadline=(
+                  datetime.now().strftime("%Y-%m-%d") + "T23:59:00"
+              ),
+              enforcement_authority="State Air Quality Management District",
+              regulatory_basis="Clean Air Act Sec. 113; State AQMD Rule 1001",
+        )
 
-        case_num = f"ENF-{_dt.now().strftime('%Y%m%d-%H%M%S')}-{nc['source_id']}"
-        action = {
-            "case_number":     case_num,
-            "action_type":     action_type,
-            "source_id":       nc["source_id"],
-            "source_name":     nc["source_name"],
-            "compliance_status": nc["compliance_status"],
-            "required_action": "Immediately implement all available emission reduction measures and report compliance within 4 hours.",
-            "issued_at":       _dt.now().isoformat(),
-            "status":          "issued",
-        }
-        reg_actions.append(action)
-        print(f"  [REGULATORY] {action_type.upper()}: {nc['source_name']}")
+    # 3d. Hospital network alert (always call for AQI > 100)
+    if max_aqi > 100:
+        hosp_level = "critical" if emergency else "high" if max_aqi > 150 else "elevated"
+        vol_increase = 45.0 if emergency else 20.0 if max_aqi > 150 else 10.0
+        _call(notify_hospital_network,
+              alert_level=hosp_level,
+              affected_districts=critical_districts or ["Downtown Core"],
+              primary_pollutant=dominant_pol,
+              aqi=max_aqi,
+              expected_case_types=[
+                  "asthma exacerbation",
+                  "COPD exacerbation",
+                  "chest pain",
+                  "respiratory distress",
+              ],
+              expected_volume_increase_pct=vol_increase,
+              special_instructions=(
+                  "Pre-position nebulisers, bronchodilators, and supplemental O2. "
+                  "Activate respiratory triage protocol. "
+                  + ("Activate emergency surge capacity." if emergency else "")
+              ),
+        )
 
-    # Hospital notification
-    hospital_notifs = []
-    if hospital_level in ("elevated", "high", "critical") or max_aqi >= air_config.aqi_unhealthy:
-        notif_id = f"HOSP-{_dt.now().strftime('%Y%m%d-%H%M%S')}"
-        notif = {
-            "notification_id":   notif_id,
-            "alert_level":       hospital_level,
-            "aqi":               max_aqi,
-            "primary_pollutant": dom_pol,
-            "expected_case_types": ["asthma exacerbation", "COPD exacerbation",
-                                    "cardiovascular event", "respiratory distress"],
-            "expected_volume_increase_pct": 15.0 if max_aqi < 200 else 35.0,
-            "hospitals_notified": 6,
-            "issued_at":         _dt.now().isoformat(),
-            "status":            "dispatched",
-        }
-        hospital_notifs.append(notif)
-        print(f"  [HOSPITAL ALERT - {hospital_level.upper()}] AQI {max_aqi} ({dom_pol}) "
-              f"— expected ED volume increase {notif['expected_volume_increase_pct']:.0f}%")
+    # 3e. Traffic restriction (if dispersion poor)
+    if vc < 6000 and max_aqi > 100:
+        _call(request_traffic_restriction,
+              restriction_type="hgv_ban",
+              affected_zones=critical_districts or ["Downtown Core", "East Industrial District"],
+              vehicles_affected="Heavy goods vehicles (>3.5t), pre-Euro 5 diesel",
+              start_time="06:00",
+              end_time="22:00",
+              reason=(
+                  f"Air quality episode: AQI {max_aqi}, ventilation coefficient {vc} m²/s."
+              ),
+              legal_basis="Road Traffic Regulation Act s.1(1) — Air Quality Emergency",
+        )
 
-    # If LLM available, use it instead
-    try:
-        from agents.base import _demo_mode as _dm
-        if not _dm():
-            analysis, tool_results = call_llm_with_tools(
-                system_prompt=ALERT_SYSTEM,
-                user_message=(
-                    "Issue all required alerts and notifications. "
-                    f"Max AQI: {max_aqi}, severity: {severity}, "
-                    f"non-compliant sources: {[s['source_name'] for s in non_compliant]}"
-                ),
-                tools=[issue_public_health_alert, issue_regulatory_action, notify_hospital_network],
-            )
-            llm_alerts  = [tr["result"] for tr in tool_results if tr.get("tool") == "issue_public_health_alert"]
-            llm_reg     = [tr["result"] for tr in tool_results if tr.get("tool") == "issue_regulatory_action"]
-            llm_hosp    = [tr["result"] for tr in tool_results if tr.get("tool") == "notify_hospital_network"]
-            if llm_alerts or llm_reg:
-                public_alerts = llm_alerts
-                reg_actions   = llm_reg
-                hospital_notifs = llm_hosp
-    except Exception:
-        pass
+    # ── Final: synthesise situation report in demo mode ───────────────────────
+    state["situation_report"] = _build_demo_report(
+        state, max_aqi, avg_aqi, dominant_pol, non_compliant,
+        met, sat, tool_results_log, scenario,
+    )
+    state = _extract_state_from_tool_log(state, tool_results_log, scenario)
 
-    print(f"  Public alerts issued: {len(public_alerts)}")
-    print(f"  Regulatory actions:   {len(reg_actions)}")
-    print(f"  Hospital notifications: {len(hospital_notifs)}")
-
-    state["public_alerts"]      = public_alerts
-    state["regulatory_actions"] = state.get("regulatory_actions", []) + reg_actions
-    state["current_agent"]      = "supervisor_synthesis"
+    print(f"\n  [DEMO ReAct] Loop complete. Tools called: {len(tool_results_log)}")
+    _print_completion_summary(state, len(tool_results_log))
     return state
 
 
-# ---------------------------------------------------------------------------
-# Agent 9: Supervisor — Synthesis
-# ---------------------------------------------------------------------------
+# ============================================================================
+# State extraction helpers
+# ============================================================================
 
-SYNTHESIS_SYSTEM = """You are the Supervisor Agent for an urban air quality monitoring
-system. You have received completed analyses from all domain agents:
-  - Ground sensor analysis (real-time station network)
-  - Satellite imagery analysis (hotspots, plumes, fires)
-  - Meteorological / dispersion analysis
-  - Pollution source attribution
-  - Public health impact assessment
-  - Mitigation action plan
-  - Alert and regulatory notification summary
-
-Your task is to produce a final SITUATION REPORT structured as follows:
-
-SECTION 1: EXECUTIVE SUMMARY (3-5 sentences: overall air quality status, immediate risk level,
-           number of sources identified, number of actions taken)
-
-SECTION 2: CURRENT AIR QUALITY STATUS
-  - Network-wide AQI statistics (max, average, worst stations)
-  - District-level breakdown
-  - Dominant pollutants and their sources
-
-SECTION 3: POLLUTION SOURCE ATTRIBUTION
-  - Primary sources contributing to current episode
-  - Compliance status of each source
-  - Estimated contribution percentages
-
-SECTION 4: HEALTH IMPACT ASSESSMENT
-  - Population at risk
-  - Sensitive groups and specific risks
-  - Hospital preparedness level
-
-SECTION 5: METEOROLOGICAL ASSESSMENT
-  - Dispersion quality and forecast
-  - Expected episode evolution over next 12-24 hours
-
-SECTION 6: ACTIONS TAKEN
-  - Public alerts issued
-  - Regulatory enforcement actions
-  - Traffic restrictions
-  - Mitigation recommendations (summarized by priority)
-
-SECTION 7: PRIORITY ACTIONS OUTSTANDING (not yet implemented, recommended for regulatory decision)
-
-Conclude with an OVERALL RISK LEVEL: CRITICAL / HIGH / ELEVATED / MODERATE / LOW
-and an OVERALL AQI FORECAST for the next 6 hours."""
-
-def supervisor_synthesis_agent(state: dict) -> dict:
+def _extract_state_from_tool_log(state: dict, tool_log: list, scenario: str) -> dict:
     """
-    Reads all agent analyses and produces the final consolidated situation report.
+    Reconstruct the pipeline-compatible state dict from the flat tool results log.
+    Mirrors what the individual linear agents used to populate in state directly.
     """
-    print("\n[SUPERVISOR — SYNTHESIS] Compiling final situation report...")
+    for entry in tool_log:
+        name   = entry["tool"]
+        result = entry["result"]
 
-    risk_scores = state.get("risk_scores", [])
-    levels_map  = {"good": 1, "moderate": 2, "unhealthy_sensitive": 3,
-                   "unhealthy": 4, "very_unhealthy": 5, "hazardous": 6,
-                   "normal": 1, "elevated": 3, "high": 5, "critical": 6,
-                   "poor": 3, "very_poor": 5, "low": 1, "medium": 2}
-    risk_values = [levels_map.get(str(rs.get("level", "low")).lower(), 2) for rs in risk_scores]
-    overall_level_idx = max(risk_values) if risk_values else 2
-    level_labels = {1: "LOW", 2: "MODERATE", 3: "ELEVATED", 4: "HIGH", 5: "VERY HIGH", 6: "CRITICAL"}
-    overall_level = level_labels.get(overall_level_idx, "MODERATE")
+        if not isinstance(result, dict):
+            continue
 
-    synthesis_prompt = (
-        "Compile the final situation report from all domain analyses. "
-        f"Overall risk level computed by supervisor: {overall_level}\n\n"
-        f"GROUND ANALYSIS:\n{str(state.get('ground_analysis', 'Not available'))[:500]}\n\n"
-        f"SATELLITE ANALYSIS:\n{str(state.get('satellite_analysis', 'Not available'))[:400]}\n\n"
-        f"METEOROLOGICAL ANALYSIS:\n{str(state.get('met_analysis', 'Not available'))[:400]}\n\n"
-        f"SOURCE ATTRIBUTION:\n{str(state.get('source_analysis', 'Not available'))[:400]}\n\n"
-        f"HEALTH ANALYSIS:\n{str(state.get('health_analysis', 'Not available'))[:400]}\n\n"
-        f"ACTIONS TAKEN:\n"
-        f"  Public alerts: {len(state.get('public_alerts', []))}\n"
-        f"  Regulatory actions: {len(state.get('regulatory_actions', []))}\n"
-        f"  Mitigation recommendations: {len(state.get('mitigation_recommendations', []))}\n"
-        f"  Emergency triggered: {state.get('emergency_triggered', False)}\n"
+        if name == "fetch_ground_sensor_data":
+            state["ground_readings"] = result.get("stations", [])
+            readings = state["ground_readings"]
+            if readings:
+                max_aqi  = max(r["aqi"] for r in readings)
+                avg_aqi  = round(sum(r["aqi"] for r in readings) / len(readings), 1)
+                critical = [r for r in readings if r["aqi_category"] in
+                            ("unhealthy", "very_unhealthy", "hazardous")]
+                state["risk_scores"].append({
+                    "domain":  "ground_sensors",
+                    "max_aqi": max_aqi, "avg_aqi": avg_aqi,
+                    "level":   critical[0]["aqi_category"] if critical else "moderate",
+                    "critical_station_count": len(critical),
+                })
+                if max_aqi >= air_config.aqi_very_unhealthy:
+                    state["emergency_triggered"] = True
+
+        elif name == "fetch_satellite_imagery":
+            state["satellite_observations"] = result.get("observations", [])
+            obs = state["satellite_observations"]
+            if obs:
+                max_aod = max((o.get("aerosol_optical_depth") or 0) for o in obs)
+                fires   = sum(o.get("active_fire_count", 0) for o in obs)
+                plumes  = sum(1 for o in obs if o.get("plume_detected"))
+                state["risk_scores"].append({
+                    "domain":          "satellite",
+                    "max_aod":         max_aod,
+                    "fire_count":      fires,
+                    "plumes_detected": plumes,
+                    "level": (
+                        "hazardous"    if max_aod > 0.8 else
+                        "very_unhealthy" if max_aod > 0.6 else
+                        "unhealthy"    if max_aod > 0.4 else "moderate"
+                    ),
+                })
+
+        elif name == "fetch_meteorological_data":
+            state["meteorological_summary"] = result
+
+        elif name == "fetch_emission_inventory":
+            state["pollution_sources"] = result.get("sources", [])
+
+        elif name in ("issue_public_health_alert", "notify_hospital_network"):
+            state["public_alerts"].append(result)
+
+        elif name in ("issue_regulatory_action",):
+            state["regulatory_actions"].append(result)
+
+        elif name == "log_mitigation_recommendation":
+            # The tool returns a confirmation dict; reconstruct the full record
+            state["mitigation_recommendations"].append({
+                **entry["args"],
+                "recommendation_id": result.get("recommendation_id", "REC-DEMO"),
+                "expected_aqi_reduction": entry["args"].get("expected_aqi_reduction", 0.0),
+            })
+
+    # Build health_impact summary from ground readings
+    readings = state.get("ground_readings", [])
+    if readings:
+        max_aqi = max(r["aqi"] for r in readings)
+        avg_aqi = round(sum(r["aqi"] for r in readings) / len(readings), 1)
+        state["health_impact"] = {
+            "max_aqi":             max_aqi,
+            "avg_aqi":             avg_aqi,
+            "max_pm25_ug_m3":      max((r.get("pm25_ug_m3") or 0) for r in readings),
+            "hospital_alert_level": (
+                "critical"  if max_aqi > 200 else
+                "high"      if max_aqi > 150 else
+                "elevated"  if max_aqi > 100 else "normal"
+            ),
+            "emergency_response":  state.get("emergency_triggered", False),
+        }
+
+    return state
+
+
+def _build_demo_report(state, max_aqi, avg_aqi, dominant_pol,
+                       non_compliant, met, sat, tool_log, scenario) -> str:
+    """Build a structured demo situation report (no LLM)."""
+    n_alerts = sum(1 for e in tool_log if e["tool"] == "issue_public_health_alert")
+    n_reg    = sum(1 for e in tool_log if e["tool"] == "issue_regulatory_action")
+    n_rec    = sum(1 for e in tool_log if e["tool"] == "log_mitigation_recommendation")
+    n_hosp   = sum(1 for e in tool_log if e["tool"] == "notify_hospital_network")
+
+    risk_level = (
+        "CRITICAL"  if max_aqi > 300 else
+        "HIGH"      if max_aqi > 200 else
+        "ELEVATED"  if max_aqi > 150 else
+        "MODERATE"  if max_aqi > 100 else
+        "LOW"
     )
 
-    report = call_llm(
-        system_prompt=SYNTHESIS_SYSTEM,
-        user_message=synthesis_prompt,
-        max_tokens=1600,
+    aqi_forecast = max(50, max_aqi - 20) if met.get("dispersion_quality") not in ("very_poor", "poor") \
+                   else min(500, max_aqi + 30)
+
+    return (
+        f"[DEMO MODE — configure OPENAI_API_KEY in .env for live LLM analysis]\n\n"
+        f"SITUATION REPORT — {air_config.city} Air Quality Monitoring System\n"
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} | Scenario: {scenario.upper()}\n\n"
+        f"SECTION 1: EXECUTIVE SUMMARY\n"
+        f"The air quality monitoring network is reporting a maximum AQI of {max_aqi} "
+        f"(average {avg_aqi}) across {len(state.get('ground_readings', []))} stations. "
+        f"The dominant pollutant is {dominant_pol}. "
+        f"{len(non_compliant)} emission source(s) are currently non-compliant. "
+        f"The ReAct agent took {len(tool_log)} tool calls to complete the analysis.\n\n"
+        f"SECTION 2: CURRENT AIR QUALITY STATUS\n"
+        f"  Max AQI: {max_aqi} | Avg AQI: {avg_aqi} | Dominant pollutant: {dominant_pol}\n"
+        f"  Dispersion: {met.get('dispersion_quality', 'N/A').upper()} "
+        f"(VC={met.get('ventilation_coefficient_m2_s', 'N/A')} m²/s)\n"
+        f"  Satellite AOD: {sat.get('max_aerosol_optical_depth', 'N/A')} | "
+        f"Active fires: {sat.get('total_active_fire_count', 0)}\n\n"
+        f"SECTION 3: SOURCE ATTRIBUTION\n"
+        f"  {len(non_compliant)} non-compliant source(s) identified in emission inventory.\n\n"
+        f"SECTION 4: HEALTH IMPACT\n"
+        f"  Hospital alert level: {'CRITICAL' if max_aqi > 200 else 'HIGH' if max_aqi > 150 else 'ELEVATED'}\n\n"
+        f"SECTION 5: METEOROLOGICAL ASSESSMENT\n"
+        f"  {met.get('forecast_12h', 'Forecast unavailable')}\n\n"
+        f"SECTION 6: ACTIONS TAKEN\n"
+        f"  Mitigation recommendations logged : {n_rec}\n"
+        f"  Public health alerts issued       : {n_alerts}\n"
+        f"  Regulatory enforcement actions    : {n_reg}\n"
+        f"  Hospital network notifications    : {n_hosp}\n\n"
+        f"SECTION 7: OUTSTANDING ACTIONS\n"
+        f"  Await compliance confirmation from all non-compliant sources.\n"
+        f"  Monitor ventilation coefficient for improvement before relaxing restrictions.\n\n"
+        f"OVERALL RISK LEVEL: {risk_level}\n"
+        f"OVERALL AQI FORECAST (next 6h): {aqi_forecast}\n\n"
+        f"Disclaimer: {air_config.disclaimer}"
     )
 
-    state["situation_report"] = report
-    state["current_agent"]    = "END"
 
+# ============================================================================
+# Utility helpers
+# ============================================================================
+
+def _make_empty_state(scenario: str) -> dict:
+    """Return the initial state dict matching the original schema."""
+    return {
+        "target_region":              scenario,
+        "analysis_timestamp":         datetime.now().isoformat(),
+        "ground_readings":            [],
+        "satellite_observations":     [],
+        "meteorological_summary":     {},
+        "pollution_sources":          [],
+        "ground_analysis":            None,
+        "satellite_analysis":         None,
+        "source_analysis":            None,
+        "met_analysis":               None,
+        "health_analysis":            None,
+        "dispersion_analysis":        None,
+        "health_impact":              {},
+        "risk_scores":                [],
+        "mitigation_recommendations": [],
+        "public_alerts":              [],
+        "regulatory_actions":         [],
+        "situation_report":           None,
+        "current_agent":              "react_agent",
+        "iteration_count":            0,
+        "emergency_triggered":        False,
+        "errors":                     [],
+    }
+
+
+def _fmt_args(args: dict) -> str:
+    """Format tool call arguments for compact console printing."""
+    if not args:
+        return ""
+    short = {k: (v if len(str(v)) < 40 else str(v)[:37] + "...") for k, v in args.items()}
+    return ", ".join(f"{k}={repr(v)}" for k, v in list(short.items())[:3])
+
+
+def _summarise(tool_name: str, result) -> str:
+    """One-line summary of a tool result for console printing."""
+    if not isinstance(result, dict):
+        return str(result)[:100]
+    if tool_name == "fetch_ground_sensor_data":
+        return (f"max_aqi={result.get('network_max_aqi')}, "
+                f"stations={result.get('station_count')}, "
+                f"critical={result.get('critical_stations')}")
+    if tool_name == "fetch_satellite_imagery":
+        return (f"max_aod={result.get('max_aerosol_optical_depth')}, "
+                f"fires={result.get('total_active_fire_count')}, "
+                f"plumes={result.get('plume_detections')}")
+    if tool_name == "fetch_meteorological_data":
+        return (f"vc={result.get('ventilation_coefficient_m2_s')} m²/s, "
+                f"dispersion={result.get('dispersion_quality')}")
+    if tool_name == "fetch_emission_inventory":
+        return (f"sources={result.get('total_sources')}, "
+                f"non_compliant={result.get('non_compliant_count')}")
+    if tool_name == "issue_public_health_alert":
+        return f"alert_id={result.get('alert_id')}, severity={result.get('severity')}"
+    if tool_name == "issue_regulatory_action":
+        return f"case={result.get('case_number')}, type={result.get('action_type')}"
+    if tool_name == "log_mitigation_recommendation":
+        return f"rec_id={result.get('recommendation_id')}, priority={result.get('priority')}"
+    if tool_name == "notify_hospital_network":
+        return f"notif_id={result.get('notification_id')}, level={result.get('alert_level')}"
+    return str(result)[:80]
+
+
+def _print_completion_summary(state: dict, iterations: int) -> None:
+    """Print the same completion block as the original supervisor_synthesis_agent."""
+    readings = state.get("ground_readings", [])
+    max_aqi  = max((r["aqi"] for r in readings), default=0)
+    risk_level = (
+        "CRITICAL" if max_aqi > 300 else "VERY HIGH" if max_aqi > 200 else
+        "HIGH"     if max_aqi > 150 else "ELEVATED"  if max_aqi > 100 else "MODERATE"
+    )
     print("\n" + "=" * 70)
-    print("  SITUATION REPORT COMPLETE")
-    print(f"  Overall Risk Level: {overall_level}")
-    print(f"  Ground readings:    {len(state.get('ground_readings', []))} stations")
+    print("  REACT SITUATION REPORT COMPLETE")
+    print(f"  Overall Risk Level: {risk_level}")
+    print(f"  ReAct iterations:   {iterations}")
+    print(f"  Ground readings:    {len(readings)} stations")
     print(f"  Satellite obs:      {len(state.get('satellite_observations', []))} platforms")
     print(f"  Sources identified: {len(state.get('pollution_sources', []))}")
     print(f"  Mitigations logged: {len(state.get('mitigation_recommendations', []))}")
@@ -1013,5 +853,3 @@ def supervisor_synthesis_agent(state: dict) -> dict:
     print(f"  Emergency flag:     {state.get('emergency_triggered', False)}")
     print(f"  Disclaimer: {air_config.disclaimer}")
     print("=" * 70)
-
-    return state
