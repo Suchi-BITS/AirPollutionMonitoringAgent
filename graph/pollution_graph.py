@@ -1,63 +1,100 @@
-# graph/pollution_graph.py
-# LangGraph StateGraph for the Air Pollution Monitoring Agent pipeline.
+# graph/react_graph.py
 #
-# Graph topology:
+# LangGraph StateGraph for the ReAct Air Pollution Monitoring Agent.
+#
+# ════════════════════════════════════════════════════════════════════
+# TOPOLOGY COMPARISON
+# ════════════════════════════════════════════════════════════════════
+#
+# LINEAR (original pollution_graph.py):
 #
 #   START
-#     -> supervisor_init
-#     -> ground_sensor_agent
-#     -> satellite_agent
-#     -> meteorological_agent
-#     -> source_identification_agent
-#     -> health_impact_agent
-#     -> mitigation_agent
-#     -> alert_agent
-#     -> supervisor_synthesis
+#     → supervisor_init        (runs once)
+#     → ground_sensor_agent    (runs once)
+#     → satellite_agent        (runs once)
+#     → meteorological_agent   (runs once)
+#     → source_identification  (runs once)
+#     → health_impact_agent    (runs once)
+#     → mitigation_agent       (runs once)
+#     → alert_agent            (runs once)
+#     → supervisor_synthesis   (runs once)
 #   END
 #
-# The pipeline is strictly sequential: each agent enriches the shared state
-# before passing it to the next. All domain agents run regardless of scenario
-# severity. The emergency flag in state can be read by downstream agents to
-# escalate their outputs, but does not alter the graph topology.
+#   9 nodes. 8 hard-wired add_edge() calls. Zero conditional logic.
+#   emergency_triggered is a data flag — it never changes the path.
+#
+# ════════════════════════════════════════════════════════════════════
+#
+# REACT (this file):
+#
+#   START
+#     → react_agent_node       (runs N times in a loop)
+#       |
+#       +-- should_continue()  ← conditional edge
+#             ↓ "continue"
+#         react_agent_node     (loop back — LLM has more tool calls)
+#             ↓ "end"
+#           END                (LLM produced no tool calls — reasoning complete)
+#
+#   1 node. 1 conditional edge. The LLM controls when the loop stops.
+#
+# ════════════════════════════════════════════════════════════════════
+#
+# WHY THIS IS ReAct:
+#
+#   The node react_agent_node wraps an LLM call with bind_tools(ALL_TOOLS).
+#   The LLM response is inspected by should_continue():
+#     - If the AIMessage has tool_calls → the node routes to "continue"
+#       → tool executor runs each tool, appends ToolMessages to state
+#       → react_agent_node is called again with the enriched message history
+#     - If the AIMessage has NO tool_calls → routes to "end"
+#       → the message content is the final situation report
+#
+#   This is exactly the pattern described in the LangGraph ReAct tutorial:
+#   https://langchain-ai.github.io/langgraph/tutorials/introduction/
+#
+# ════════════════════════════════════════════════════════════════════
 
-from typing import TypedDict, List, Optional, Any
+from typing import TypedDict, List, Optional, Any, Annotated
+import operator
 
 try:
-    from langgraph.graph import StateGraph, START, END
+    from langgraph.graph import StateGraph, START, END, MessagesState
+    from langgraph.prebuilt import ToolNode
     LANGGRAPH_AVAILABLE = True
 except ImportError:
     LANGGRAPH_AVAILABLE = False
 
-from agents.all_agents import (
-    supervisor_init_agent,
-    ground_sensor_agent,
-    satellite_agent,
-    meteorological_agent,
-    source_identification_agent,
-    health_impact_agent,
-    mitigation_agent,
-    alert_agent,
-    supervisor_synthesis_agent,
-)
+from agents.react_agent import ALL_TOOLS, REACT_SYSTEM_PROMPT, MAX_ITERATIONS
 
 
-# ---------------------------------------------------------------------------
-# TypedDict state schema for LangGraph
-# ---------------------------------------------------------------------------
+# ── State schema ─────────────────────────────────────────────────────────────
+#
+# ReAct state is MESSAGE-BASED, not field-based.
+#
+# KEY DIFFERENCE from linear AirQualityState TypedDict:
+#   Linear: each field (ground_readings, satellite_observations, ...) was
+#           written by a dedicated agent, held as structured data.
+#   ReAct:  ALL information lives in the `messages` list — the LLM reads
+#           its own prior ToolMessages as its "memory" of observations.
+#
+# The `Annotated[List, operator.add]` reducer means new messages are
+# appended to the list, not overwritten (LangGraph merge behaviour).
+#
+# Auxiliary fields mirror the original state schema so that main.py's
+# print_report_section() requires zero changes.
 
-class AirQualityState(TypedDict, total=False):
+class ReactAirQualityState(TypedDict, total=False):
+    # ── Core ReAct state ─────────────────────────────────────────────────────
+    messages: Annotated[List[Any], operator.add]  # Full conversation history
+
+    # ── Auxiliary fields (populated by state extractor after loop ends) ──────
     target_region:               Optional[str]
     analysis_timestamp:          Optional[str]
     ground_readings:             List[Any]
     satellite_observations:      List[Any]
     meteorological_summary:      Optional[Any]
     pollution_sources:           List[Any]
-    ground_analysis:             Optional[str]
-    satellite_analysis:          Optional[str]
-    source_analysis:             Optional[str]
-    met_analysis:                Optional[str]
-    health_analysis:             Optional[str]
-    dispersion_analysis:         Optional[str]
     health_impact:               Optional[Any]
     risk_scores:                 List[Any]
     mitigation_recommendations:  List[Any]
@@ -70,65 +107,138 @@ class AirQualityState(TypedDict, total=False):
     errors:                      List[Any]
 
 
-def build_graph():
-    """
-    Construct and compile the LangGraph StateGraph.
+# ── Node: ReAct agent ─────────────────────────────────────────────────────────
+#
+# This is the ONLY "agent" node. It replaces all nine agent nodes from the
+# linear graph. On every entry, it calls the LLM with the full message history
+# and the bound tools. It appends the LLM's response to the messages list.
 
-    Returns the compiled graph, ready for .invoke() or .stream().
+def react_agent_node(state: ReactAirQualityState) -> dict:
+    """
+    Single ReAct agent node. Calls LLM with all tools bound.
+    Returns {"messages": [ai_response]} which LangGraph appends to state.messages.
+    """
+    try:
+        from langchain_openai import ChatOpenAI
+        from langchain_core.messages import SystemMessage, HumanMessage
+    except ImportError:
+        return {"errors": ["langchain_openai not installed"]}
+
+    from config.settings import air_config
+
+    llm = ChatOpenAI(
+        model=air_config.model_name,
+        temperature=air_config.temperature,
+        api_key=air_config.openai_api_key,
+        max_tokens=2000,
+    )
+    llm_with_tools = llm.bind_tools(ALL_TOOLS)
+
+    messages = state.get("messages", [])
+
+    # Inject system prompt on first call if not already present
+    from langchain_core.messages import SystemMessage as SM
+    if not messages or not isinstance(messages[0], SM):
+        messages = [SM(content=REACT_SYSTEM_PROMPT)] + list(messages)
+
+    response = llm_with_tools.invoke(messages)
+
+    iteration = state.get("iteration_count", 0) + 1
+    n_tool_calls = len(getattr(response, "tool_calls", []) or [])
+    print(f"  [LangGraph ReAct] Iteration {iteration}: "
+          f"{'→ ' + str(n_tool_calls) + ' tool call(s)' if n_tool_calls else '→ FINAL RESPONSE (no tool calls)'}")
+
+    return {
+        "messages":       [response],
+        "iteration_count": iteration,
+    }
+
+
+# ── Conditional edge: should_continue ────────────────────────────────────────
+#
+# This is what makes the graph a loop instead of a straight line.
+# should_continue() is called AFTER react_agent_node every time.
+# It inspects the last AIMessage and routes accordingly.
+
+def should_continue(state: ReactAirQualityState) -> str:
+    """
+    Routing function for the conditional edge after react_agent_node.
+
+    Returns:
+        "continue" → route to tool_node (execute tool calls, loop back)
+        "end"      → route to END (write final report from last message)
+    """
+    messages    = state.get("messages", [])
+    iteration   = state.get("iteration_count", 0)
+    last_msg    = messages[-1] if messages else None
+
+    tool_calls  = getattr(last_msg, "tool_calls", None) or []
+
+    if iteration >= MAX_ITERATIONS:
+        print(f"  [LangGraph ReAct] Max iterations ({MAX_ITERATIONS}) reached → forcing END")
+        return "end"
+
+    if tool_calls:
+        return "continue"   # → ToolNode → back to react_agent_node
+    return "end"            # → END
+
+
+# ── Build and compile the graph ───────────────────────────────────────────────
+
+def build_react_graph():
+    """
+    Construct and compile the LangGraph ReAct graph.
+
+    Graph topology:
+        START → react_agent_node
+                     ↕ (loop via conditional edge)
+                  tool_node
+                     ↓
+                    END
+
     Falls back gracefully if LangGraph is not installed.
     """
     if not LANGGRAPH_AVAILABLE:
+        print("  [WARNING] LangGraph not installed — ReAct graph unavailable.")
         return None
 
-    graph = StateGraph(AirQualityState)
+    graph = StateGraph(ReactAirQualityState)
 
-    # Register all agent nodes
-    graph.add_node("supervisor_init",            supervisor_init_agent)
-    graph.add_node("ground_sensor_agent",        ground_sensor_agent)
-    graph.add_node("satellite_agent",            satellite_agent)
-    graph.add_node("meteorological_agent",       meteorological_agent)
-    graph.add_node("source_identification_agent", source_identification_agent)
-    graph.add_node("health_impact_agent",        health_impact_agent)
-    graph.add_node("mitigation_agent",           mitigation_agent)
-    graph.add_node("alert_agent",                alert_agent)
-    graph.add_node("supervisor_synthesis",       supervisor_synthesis_agent)
+    # ── Register nodes ────────────────────────────────────────────────────────
+    graph.add_node("react_agent_node", react_agent_node)
 
-    # Wire the sequential pipeline
-    graph.add_edge(START,                         "supervisor_init")
-    graph.add_edge("supervisor_init",             "ground_sensor_agent")
-    graph.add_edge("ground_sensor_agent",         "satellite_agent")
-    graph.add_edge("satellite_agent",             "meteorological_agent")
-    graph.add_edge("meteorological_agent",        "source_identification_agent")
-    graph.add_edge("source_identification_agent", "health_impact_agent")
-    graph.add_edge("health_impact_agent",         "mitigation_agent")
-    graph.add_edge("mitigation_agent",            "alert_agent")
-    graph.add_edge("alert_agent",                 "supervisor_synthesis")
-    graph.add_edge("supervisor_synthesis",        END)
+    # ToolNode is a LangGraph built-in that:
+    #   1. reads tool_calls from the last AIMessage
+    #   2. executes each tool via its .invoke() method
+    #   3. appends the results as ToolMessages to state.messages
+    graph.add_node("tool_node", ToolNode(ALL_TOOLS))
+
+    # ── Wire the graph ────────────────────────────────────────────────────────
+    graph.add_edge(START, "react_agent_node")
+
+    # Conditional edge: after every react_agent_node call, check should_continue
+    graph.add_conditional_edges(
+        "react_agent_node",
+        should_continue,
+        {
+            "continue": "tool_node",   # LLM wants to call tools → execute them
+            "end":      END,           # LLM is done → finish
+        },
+    )
+
+    # After tool execution, always go back to the agent for the next thought
+    graph.add_edge("tool_node", "react_agent_node")
 
     return graph.compile()
 
 
-def run_direct_pipeline(initial_state: dict) -> dict:
+# ── Fallback: run without LangGraph ──────────────────────────────────────────
+
+def run_react_pipeline(scenario: str = "standard") -> dict:
     """
-    Fallback pipeline that runs all agents in sequence without LangGraph.
-    Used automatically when LangGraph is not installed.
+    Fallback that runs the ReAct agent without the LangGraph graph wrapper.
+    Used when LangGraph is not installed.
+    Delegates entirely to agents/react_agent.py which has its own loop.
     """
-    state = initial_state.copy()
-    agents = [
-        supervisor_init_agent,
-        ground_sensor_agent,
-        satellite_agent,
-        meteorological_agent,
-        source_identification_agent,
-        health_impact_agent,
-        mitigation_agent,
-        alert_agent,
-        supervisor_synthesis_agent,
-    ]
-    for agent_fn in agents:
-        try:
-            state = agent_fn(state)
-        except Exception as e:
-            print(f"  [ERROR in {agent_fn.__name__}]: {e}")
-            state["errors"].append({"agent": agent_fn.__name__, "error": str(e)})
-    return state
+    from agents.react_agent import run_react_agent
+    return run_react_agent(scenario)
