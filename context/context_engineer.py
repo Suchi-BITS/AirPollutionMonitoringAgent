@@ -95,7 +95,8 @@ class ContextEngineer:
 
     def build_system_prompt(self, scenario: str,
                             memory_summary: str,
-                            max_aqi_hint: Optional[int] = None) -> str:
+                            max_aqi_hint: Optional[int] = None,
+                            rag_context: str = "") -> str:
         """
         Build the per-run system prompt.
 
@@ -103,6 +104,7 @@ class ContextEngineer:
             scenario:       'standard' | 'episode'
             memory_summary: ShortTermMemory.context_summary() text block
             max_aqi_hint:   last known max AQI — selects severity guidance tier
+            rag_context:    RAG-retrieved regulatory/health documents to inject
         """
         from config.settings import air_config
 
@@ -112,6 +114,8 @@ class ContextEngineer:
             severity_block = _HIGH_GUIDANCE
         else:
             severity_block = _STANDARD_GUIDANCE
+
+        rag_section = f"\n{rag_context}\n" if rag_context else ""
 
         return (
             f"You are the AirGuard ReAct Agent — air quality monitoring and response "
@@ -123,8 +127,9 @@ class ContextEngineer:
             f"  4. Write a focused situation report\n\n"
             f"══════════════════════════════════════════════\n"
             f"{memory_summary}\n"
-            f"══════════════════════════════════════════════\n\n"
-            f"OBSERVATION TOOLS (call all five every run):\n"
+            f"══════════════════════════════════════════════"
+            f"{rag_section}"
+            f"\n\nOBSERVATION TOOLS (call all five every run):\n"
             f"  fetch_ground_sensor_data(scenario)   → AQI, PM2.5, SO2, NO2 per station\n"
             f"  fetch_satellite_imagery(scenario)    → AOD, fire count, plume detection\n"
             f"  fetch_meteorological_data(scenario)  → wind, mixing height, VC, stability\n"
@@ -150,11 +155,26 @@ class ContextEngineer:
             f"  request_traffic_restriction(restriction_type, affected_zones,\n"
             f"      vehicles_affected, start_time, end_time, reason, legal_basis)\n\n"
             f"  get_action_log(limit)   → review actions already logged this run\n\n"
+            f"KNOWLEDGE & EXTERNAL TOOLS:\n"
+            f"  query_knowledge_base(query, category, top_k)\n"
+            f"    → Retrieve verified WHO/EPA/AQMD regulations, health C-R functions,\n"
+            f"      episode protocols.  Call BEFORE citing any specific threshold value.\n\n"
+            f"  send_incident_notification_email(recipient_role, recipient_email,\n"
+            f"      incident_type, subject, message_body, cc_emails)\n"
+            f"    → Email enforcement officers via Gmail MCP after emergency actions\n\n"
+            f"  create_response_calendar_event(event_title, event_type, description,\n"
+            f"      duration_hours, attendee_emails)\n"
+            f"    → Timestamp incidents and compliance deadlines in Google Calendar MCP\n\n"
+            f"  check_compliance_inbox(search_query, max_results)\n"
+            f"    → Search Gmail MCP inbox for inspector field reports\n\n"
+            f"  get_compliance_deadlines(days_ahead)\n"
+            f"    → Retrieve upcoming enforcement deadlines from Google Calendar MCP\n\n"
             f"{severity_block}\n\n"
             f"STOPPING CRITERION — stop calling tools when ALL are met:\n"
             f"  ✓ All 5 observation tools called at least once\n"
             f"  ✓ All NEW or ESCALATED actions issued\n"
-            f"  ✓ At least 1 mitigation recommendation logged\n\n"
+            f"  ✓ At least 1 mitigation recommendation logged\n"
+            f"  ✓ Emergency actions notified via email (if AQI > 300)\n\n"
             f"Disclaimer: {air_config.disclaimer}"
         )
 
@@ -352,9 +372,13 @@ class ContextEngineer:
         """
         Entry point called once per run by react_agent.py before the ReAct loop.
 
+        Now includes RAG retrieval: regulatory/health documents relevant to
+        the current AQI level and dominant pollutant are fetched from the
+        KnowledgeBase and injected into the system prompt.
+
         Returns:
             {
-              "system_prompt":         str   — dynamic, includes live memory state
+              "system_prompt":         str   — dynamic: memory + RAG + severity guidance
               "initial_human_message": str   — task description for this run
               "token_estimate":        int   — rough token count of system_prompt
             }
@@ -362,11 +386,37 @@ class ContextEngineer:
         memory_summary = memory.context_summary()
         trend          = memory.get_aqi_trend()
         max_aqi_hint   = trend.get("current_max_aqi") if trend.get("available") else None
+        emergency      = (max_aqi_hint or 0) > 300
+
+        # RAG: retrieve verified regulatory/health documents for current conditions
+        rag_context = ""
+        try:
+            from rag.rag_retriever import RAG_RETRIEVER
+            dominant_pol = (
+                memory.aqi_history[-1].dominant_pollutant
+                if memory.aqi_history else "PM2.5"
+            )
+            episode_stage = (
+                3 if emergency else
+                2 if (max_aqi_hint or 0) > 200 else
+                1 if (max_aqi_hint or 0) > 150 else 0
+            )
+            rag_context = RAG_RETRIEVER.build_rag_context(
+                max_aqi            = max_aqi_hint or 0,
+                dominant_pollutant = dominant_pol,
+                emergency          = emergency,
+                episode_stage      = episode_stage,
+            )
+            print(f"  [RAG] Context injected: {len(rag_context)} chars | "
+                  f"AQI={max_aqi_hint}, pol={dominant_pol}, stage={episode_stage}")
+        except Exception as e:
+            print(f"  [RAG] Retrieval skipped: {e}")
 
         system_prompt = self.build_system_prompt(
             scenario       = scenario,
             memory_summary = memory_summary,
             max_aqi_hint   = max_aqi_hint,
+            rag_context    = rag_context,
         )
 
         run_num = memory.run_count + 1
