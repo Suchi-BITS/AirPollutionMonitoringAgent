@@ -145,7 +145,7 @@ def print_report_section(state: dict) -> None:
         print("\nSITUATION REPORT (excerpt)")
         print("-" * 50)
         # Print first 500 chars; full report is in state["situation_report"]
-        print(report[:600] + ("..." if len(report) > 600 else ""))
+        print(report[:1500] + ("..." if len(report) > 1500 else ""))
 
     print("\n" + "=" * 70)
     if state.get("errors"):
