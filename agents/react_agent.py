@@ -74,19 +74,34 @@ from tools.action_tools import (
     request_traffic_restriction,
     get_action_log,
 )
+from mcp.mcp_tools import (
+    send_incident_notification_email,
+    check_compliance_inbox,
+    create_response_calendar_event,
+    get_compliance_deadlines,
+    query_knowledge_base,
+)
 
 ALL_TOOLS = [
+    # ── Observation (call all 5 first) ────────────────────────────────────────
     fetch_ground_sensor_data,
     fetch_satellite_imagery,
     fetch_meteorological_data,
     fetch_emission_inventory,
     fetch_health_risk_tables,
+    # ── In-system actions ─────────────────────────────────────────────────────
     log_mitigation_recommendation,
     issue_public_health_alert,
     issue_regulatory_action,
     notify_hospital_network,
     request_traffic_restriction,
     get_action_log,
+    # ── Knowledge & external (RAG + MCP) ─────────────────────────────────────
+    query_knowledge_base,               # RAG: on-demand regulatory lookup
+    send_incident_notification_email,   # MCP Gmail: notify enforcement officers
+    check_compliance_inbox,             # MCP Gmail: read inspector field reports
+    create_response_calendar_event,     # MCP Calendar: timestamp incidents
+    get_compliance_deadlines,           # MCP Calendar: upcoming deadlines
 ]
 
 MAX_ITERATIONS = 20
@@ -486,7 +501,89 @@ def _demo_react_run(state: dict, scenario: str, ctx: dict) -> dict:
             legal_basis      = "Road Traffic Regulation Act s.1(1) — Air Quality Emergency",
         )
 
-    # ── Build state and update memory ─────────────────────────────────────────
+    # 3f. RAG on-demand lookup — verify regulatory basis before finalising report
+    print("\n  ── Phase 3f: RAG on-demand lookup ──")
+    rag_query = (
+        f"Stage III emergency shutdown order AQI {max_aqi} hospital surge capacity"
+        if emergency
+        else f"{dominant_pol} compliance order AQI {max_aqi} WHO guideline limit"
+    )
+    _call(query_knowledge_base,
+        query    = rag_query,
+        category = "episode_plan" if emergency else "state_regulation",
+        top_k    = 2,
+    )
+    # Also retrieve health C-R functions for the dominant pollutant
+    _call(query_knowledge_base,
+        query    = f"{dominant_pol} concentration response health mortality asthma COPD",
+        category = "health_tables",
+        top_k    = 1,
+    )
+
+    # 3g. MCP Gmail — check inbox for compliance confirmations (run 2+)
+    print("\n  ── Phase 3g: MCP Gmail — check compliance inbox ──")
+    _call(check_compliance_inbox,
+        search_query = "air quality compliance inspection field report",
+        max_results  = 3,
+    )
+
+    # 3h. MCP Gmail — notify authorities after emergency actions
+    if emergency:
+        print("\n  ── Phase 3h: MCP Gmail — incident email notification ──")
+        n_shutdown = sum(
+            1 for e in tool_log
+            if e["tool"] == "issue_regulatory_action"
+            and e.get("args", {}).get("action_type") == "emergency_shutdown_order"
+        )
+        _call(send_incident_notification_email,
+            recipient_role  = "AQMD Enforcement Director",
+            recipient_email = "enforcement.director@aqmd.demo",
+            incident_type   = "emergency_shutdown",
+            subject         = f"[EMERGENCY] AQI {max_aqi} — {n_shutdown} Shutdown Order(s) Issued",
+            message_body    = (
+                f"AirGuard automated notification.\n\n"
+                f"Current network max AQI: {max_aqi} ({dominant_pol})\n"
+                f"Emergency shutdown orders issued: {n_shutdown} source(s)\n"
+                f"Districts affected: {', '.join(critical_districts or ['Multiple'])}\n"
+                f"Ventilation coefficient: {vc} m²/s ({disp_quality})\n\n"
+                f"Please verify orders and dispatch AQMD inspection units immediately.\n\n"
+                f"This message was generated automatically by AirGuard v4 ReAct Agent."
+            ),
+            cc_emails = ["ops.center@airguard.demo", "health.dept@metrocity.demo"],
+        )
+
+    # 3i. MCP Google Calendar — create incident timeline event
+    print("\n  ── Phase 3i: MCP Google Calendar — timestamp incident ──")
+    event_type = "episode_declaration" if emergency else "compliance_deadline"
+    _call(create_response_calendar_event,
+        event_title    = (
+            f"Stage III Episode Declared — AQI {max_aqi} ({dominant_pol})"
+            if emergency else
+            f"Stage {'II' if max_aqi > 200 else 'I'} Watch Active — AQI {max_aqi}"
+        ),
+        event_type     = event_type,
+        description    = (
+            f"Scenario: {scenario.upper()}\n"
+            f"Max AQI: {max_aqi} | Avg: {avg_aqi} | Dominant: {dominant_pol}\n"
+            f"Non-compliant sources: {len(non_compliant)}\n"
+            f"Dispersion: {disp_quality} (VC={vc} m²/s)\n"
+            f"Actions: {sum(1 for e in tool_log if 'regulatory' in e['tool'])} regulatory, "
+            f"{sum(1 for e in tool_log if 'alert' in e['tool'])} public alerts\n"
+            f"Deferred items: {SESSION_MEMORY.get_alert_history_summary()['deferred_actions_pending']}"
+        ),
+        duration_hours    = 4.0 if emergency else 2.0,
+        attendee_emails   = [
+            "enforcement.director@aqmd.demo",
+            "health.dept@metrocity.demo",
+        ],
+    )
+
+    # 3j. MCP Google Calendar — check upcoming compliance deadlines (run 2+)
+    if SESSION_MEMORY.run_count >= 1:
+        print("\n  ── Phase 3j: MCP Google Calendar — check deadlines ──")
+        _call(get_compliance_deadlines, days_ahead=3)
+
+
     state = _extract_state(state, tool_log)
     state["situation_report"] = _build_demo_report(
         state, max_aqi, avg_aqi, dominant_pol,
@@ -746,10 +843,15 @@ def _one_liner(tool_name: str, compressed: str) -> str:
 def _build_demo_report(state, max_aqi, avg_aqi, dominant_pol,
                        non_compliant, met, sat, tool_log, scenario) -> str:
     """Build a structured situation report for demo mode."""
-    n_rec   = sum(1 for e in tool_log if e["tool"] == "log_mitigation_recommendation")
-    n_alert = sum(1 for e in tool_log if e["tool"] == "issue_public_health_alert")
-    n_reg   = sum(1 for e in tool_log if e["tool"] == "issue_regulatory_action")
-    n_hosp  = sum(1 for e in tool_log if e["tool"] == "notify_hospital_network")
+    n_rec    = sum(1 for e in tool_log if e["tool"] == "log_mitigation_recommendation")
+    n_alert  = sum(1 for e in tool_log if e["tool"] == "issue_public_health_alert")
+    n_reg    = sum(1 for e in tool_log if e["tool"] == "issue_regulatory_action")
+    n_hosp   = sum(1 for e in tool_log if e["tool"] == "notify_hospital_network")
+    n_rag    = sum(1 for e in tool_log if e["tool"] == "query_knowledge_base")
+    n_email  = sum(1 for e in tool_log if e["tool"] == "send_incident_notification_email")
+    n_cal    = sum(1 for e in tool_log if e["tool"] in (
+                  "create_response_calendar_event", "get_compliance_deadlines"))
+    n_inbox  = sum(1 for e in tool_log if e["tool"] == "check_compliance_inbox")
 
     risk = (
         "CRITICAL" if max_aqi > 300 else "HIGH"     if max_aqi > 200 else
@@ -769,12 +871,19 @@ def _build_demo_report(state, max_aqi, avg_aqi, dominant_pol,
         if met.get("dispersion_quality") not in ("very_poor", "poor")
         else min(500, max_aqi + 30)
     )
-    ah = SESSION_MEMORY.get_alert_history_summary()
+    ah        = SESSION_MEMORY.get_alert_history_summary()
+    run_label = SESSION_MEMORY.run_count + 1   # record_run() called AFTER this fn
 
-    # run_count is incremented inside record_run(), called from _post_run_memory_update()
-    # which is called AFTER this function.  So at this point run_count is still the
-    # PREVIOUS value.  Add 1 for the display label.
-    run_label = SESSION_MEMORY.run_count + 1
+    # Pull top RAG excerpt for the report
+    rag_excerpt = ""
+    for e in tool_log:
+        if e["tool"] == "query_knowledge_base":
+            result = e.get("result", "")
+            if isinstance(result, str) and len(result) > 50:
+                # First 300 chars of first retrieved chunk
+                excerpt = result[result.find("\n") + 1: result.find("\n") + 301]
+                rag_excerpt = f"\n  RAG reference: {excerpt.strip()[:200]}..."
+                break
 
     return (
         f"[DEMO MODE — set OPENAI_API_KEY in .env for live LLM reasoning]\n\n"
@@ -803,6 +912,15 @@ def _build_demo_report(state, max_aqi, avg_aqi, dominant_pol,
         f"  Public alerts issued : {n_alert}  (session total: {ah['public_alerts_issued']})\n"
         f"  Regulatory actions   : {n_reg}  (session total: {ah['regulatory_actions_issued']})\n"
         f"  Hospital alerts      : {n_hosp}  (session total: {ah['hospital_alerts_issued']})\n\n"
+        f"SECTION 6b — RAG KNOWLEDGE RETRIEVAL\n"
+        f"  Regulatory lookups   : {n_rag} query(s) against knowledge base\n"
+        f"  RAG injected to sys  : WHO guidelines + AQMD rules + Episode Plan + Health C-R"
+        f"{rag_excerpt}\n\n"
+        f"SECTION 6c — MCP EXTERNAL INTEGRATIONS\n"
+        f"  Gmail notifications  : {n_email} email(s) sent via Gmail MCP\n"
+        f"  Calendar events      : {n_cal} event(s) created/checked via Google Calendar MCP\n"
+        f"  Inbox checks         : {n_inbox} compliance inbox search(es)\n"
+        f"  MCP mode             : {'LIVE (Anthropic API)' if n_email + n_cal > 0 else 'DEMO'}\n\n"
         f"SECTION 7 — OUTSTANDING ACTIONS\n"
         f"  Deferred pending: {ah['deferred_actions_pending']}\n"
         + (f"  *** EPISODE DECLARED — peak AQI {SESSION_MEMORY.episode_peak_aqi}\n"
