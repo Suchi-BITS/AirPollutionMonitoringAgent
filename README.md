@@ -761,12 +761,143 @@ OVERALL RISK: ELEVATED
 
 ---
 
-## Disclaimer
+# Next Steps
 
-This system provides decision support for air quality management. All mitigation
-orders, public health advisories, and regulatory enforcement actions produced by
-this system must be reviewed and issued by authorized regulatory personnel before
-operational use. Model outputs are based on simulated or processed sensor data and
-do not constitute an official regulatory determination. RAG-retrieved regulatory
-documents are provided for informational context only and should be verified against
-current published regulations before legal use.
+Current state: The system runs as a Python command-line process with a ReAct agent loop, context engineering, short-term memory, a 22-chunk RAG knowledge base, and MCP integrations for Gmail and Google Calendar. It produces structured situation reports with public health alerts, regulatory enforcement actions, and hospital notifications.
+
+---
+
+## How End Users Access the System Today
+
+The system currently runs as a command-line Python script invoked by a technical operator.
+
+    python main.py standard --runs 3
+    python main.py episode  --runs 2
+
+This is appropriate for a developer running the system manually during development. It is not suitable for the regulatory officers, public health administrators, hospital coordinators, and enforcement directors who need to act on its outputs in a real deployment.
+
+---
+
+## Recommended Production Access Model
+
+A REST API backed by a real-time web operations dashboard is the right access model for this system. The reasoning is grounded in who the actual end users are and what they need.
+
+AQMD Enforcement Directors need to review and countersign emergency shutdown orders before they are legally valid. They need a web dashboard, not a terminal window.
+
+Public Health Officers need to approve mass notification alerts before they go to hundreds of thousands of residents. A web interface with a one-click approve and reject flow is the only practical option for that workflow.
+
+Hospital Network Coordinators need to see incoming surge alerts on the system they already monitor, not a separate application. An API that pushes alerts to HAvBED2 or an HL7 FHIR endpoint is the right integration approach.
+
+City Transport Authority needs LEZ activation and HGV ban recommendations delivered directly into their ATMS console, not as a report they have to read and manually act on.
+
+Recommended stack for the API layer: FastAPI serving JSON endpoints, with WebSocket or Server-Sent Events for pushing live AQI updates to the dashboard without polling. The dashboard itself is a React web application with a Mapbox or Leaflet map showing per-station AQI, an alert queue with approve and reject buttons, an enforcement order review panel, and an AQI trend chart reading from session memory.
+
+---
+
+## Next Action Items
+
+### Step 1 — Wrap the Agent in a FastAPI REST Service
+
+The agent currently runs as a blocking Python function. The first production step is to expose it as an API so other systems and the dashboard can call it without touching the terminal. This single step unlocks every downstream integration.
+
+Create a file called api/main.py in the project root. The minimum set of endpoints needed is:
+
+    POST /run           trigger one monitoring cycle, returns a job ID
+    GET  /status        current network AQI, trend direction, episode flag
+    GET  /alerts        all active alerts from SESSION_MEMORY as JSON
+    GET  /actions       all pending enforcement actions awaiting approval
+    POST /approve/id    human approval of a specific queued action
+
+Install: pip install fastapi uvicorn
+
+Run: uvicorn api.main:app --host 0.0.0.0 --port 8000
+
+No agent, graph, or tool code needs to change for this step. The API is a thin wrapper around the existing run_react_agent() function.
+
+---
+
+### Step 2 — Add Human-in-the-Loop for Enforcement Actions
+
+Currently the ReAct agent issues emergency shutdown orders and public health alerts without any human approval gate. For a system with legal enforcement authority this design is not acceptable in production.
+
+An AI-issued emergency shutdown order dispatched directly to a facility without a human signature has no legal standing and will be challenged immediately. The HITL gate is not optional for regulatory enforcement. It is a hard requirement.
+
+What to build is a pending approval queue in action_tools.py, modelled on the one already built for the Chronic Disease Management system. Any action of type emergency_shutdown_order or compliance_order is placed in the queue instead of being dispatched immediately. Notices of violation can auto-dispatch because their stakes are lower.
+
+The dashboard enforcement review panel needs to show the source name, the pollutant, the measured value versus the permitted limit, the regulatory basis auto-populated from the RAG retrieval result, and a set of three buttons: Approve, Modify, and Reject, with a mandatory reason field for any rejection.
+
+An auto-escalation timer should be added: if no human takes action within 15 minutes during an active episode, the system pages the duty officer via SMS.
+
+---
+
+### Step 3 — Replace Simulation with Live Sensor APIs
+
+The system uses a date-seeded random number generator for all four data streams. The production data layer pattern is already documented in the README and the .env.example file. The replacement strategy is to connect one API at a time without touching any agent or graph code.
+
+Recommended priority order:
+
+First, connect OpenAQ or EPA AirNow for ground station readings. Both are free, return JSON, and require no infrastructure. This can be done in one day.
+
+Second, connect NOAA weather.gov for meteorological data. It is free and requires no API key. Replace the get_meteorological_data() function body only.
+
+Third, connect the state AQMD SCADA telemetry feed for real-time compliance monitoring. This requires a formal data sharing agreement with the AQMD.
+
+Fourth, connect Google Earth Engine for Sentinel-5P aerosol and NO2 satellite data. This requires a GEE account and is already documented in the .env.example file.
+
+Each function in data/simulation.py has an inline production replacement comment. Replace one function at a time. No agent, graph, or tool code changes are needed in any case.
+
+---
+
+### Step 4 — Autonomous Scheduled Monitoring
+
+Currently a human must run python main.py manually to trigger a monitoring cycle. For 24/7 air quality monitoring the agent must run on an automatic schedule.
+
+The simplest approach for a single-server deployment is APScheduler running inside the FastAPI process. Configure a 30-minute interval job to match the typical AQMD sensor reporting frequency. Add a second job that checks every 5 minutes whether an episode has been declared and switches the monitoring interval to 5 minutes if so. This episode escalation logic is important because AQI conditions can change rapidly during an industrial incident.
+
+Install: pip install apscheduler
+
+For a production distributed deployment with multiple workers, replace APScheduler with Celery and Redis. Celery handles task queuing and retries, Redis is the message broker, and Flower provides a monitoring dashboard for the task queue.
+
+---
+
+### Step 5 — Persistent Memory with PostgreSQL
+
+The current SESSION_MEMORY Python object loses all AQI history, alert records, and episode metadata when the process restarts. For a 24/7 monitoring system this is a critical gap because the agent loses its deduplication context and trend history on every deployment.
+
+The minimum schema needed is three tables. An aqi_snapshots table storing one row per monitoring cycle with max AQI, average AQI, dominant pollutant, emergency flag, and dispersion quality. An issued_alerts table storing every dispatched alert with its type, severity, district, and the name of the human who approved it. An episodes table tracking each declared episode with its start time, peak AQI, dominant pollutant, stage number, and close time.
+
+The migration path is surgical. Replace the record_run() and can_issue_alert() methods in ShortTermMemory with PostgreSQL reads and writes. The context_summary() method queries the last 12 rows of aqi_snapshots. Nothing in any agent, graph, or tool file changes.
+
+---
+
+### Step 6 — Containerise and Deploy
+
+Package the system as a Docker container for repeatable deployment across environments.
+
+The Dockerfile needs a Python 3.11 slim base image, a working directory at /app, requirements installation from a pinned requirements.txt, and a CMD that starts uvicorn on port 8000.
+
+Deployment options in order of simplicity:
+
+Railway or Render: zero configuration, push to deploy, suitable for MVP demo and pilot presentations.
+
+AWS ECS Fargate: managed containers with auto-scaling, suitable for a regional AQMD production deployment.
+
+GCP Cloud Run: serverless containers with pay-per-invocation pricing, cost-optimised for systems that are idle most of the time.
+
+On-premise Kubernetes: full control with data sovereignty, required for state or national government deployments where sensor data cannot leave the premises.
+
+---
+
+## Priority Order
+
+Step 1 — FastAPI REST wrapper — 1 to 2 days — unlocks all downstream integrations
+
+Step 2 — HITL for enforcement actions — 2 to 3 days — legal and regulatory requirement
+
+Step 3 — Connect OpenAQ and AirNow — 1 day — real data immediately at no cost
+
+Step 4 — Scheduled autonomous monitoring — 1 day — removes manual operation dependency
+
+Step 5 — PostgreSQL persistent memory — 3 to 4 days — cross-session trend detection
+
+Step 6 — Docker and cloud deployment — 2 to 3 days — production-grade reliability
